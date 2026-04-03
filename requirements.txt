@@ -2,3 +2,5 @@ streamlit
 pandas
 openpyxl
 reportlab
+resend
+filelock
