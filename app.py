@@ -38,8 +38,8 @@ REQUIRED_VL06_COLUMNS = [
 ]
 
 resend.api_key = st.secrets["resend"]["api_key"]
-EMAIL_FROM = st.secrets["email"]["onboarding@resend.dev"]
-EMAIL_TO = st.secrets["email"]["wellington.feitosa@nadir.com.br"]
+EMAIL_FROM = st.secrets["email"][""]
+EMAIL_TO = st.secrets["email"][""]
 
 
 # =========================================================
