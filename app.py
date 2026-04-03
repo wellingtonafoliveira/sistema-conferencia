@@ -38,8 +38,8 @@ REQUIRED_VL06_COLUMNS = [
 ]
 
 resend.api_key = st.secrets["resend"]["api_key"]
-EMAIL_FROM = st.secrets["email"][""]
-EMAIL_TO = st.secrets["email"][""]
+EMAIL_FROM = st.secrets["email"]["from_email"]
+EMAIL_TO = st.secrets["email"]["to_email"]
 
 
 # =========================================================
