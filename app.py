@@ -1,18 +1,28 @@
 import io
 import json
+import smtplib
 from copy import deepcopy
 from datetime import datetime
+from email.message import EmailMessage
 
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import SimpleDocTemplate, Spacer, Paragraph, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 st.set_page_config(layout="wide", page_title="Conferência VL06")
 
+# =========================
+# CONFIG E-MAIL
+# =========================
+EMAIL_REMETENTE = "wellington.feitosa@nadir.com.br"
+EMAIL_SENHA = "SUA_SENHA_OU_SENHA_DE_APP"
+EMAIL_DESTINO = "wellington.feitosa@nadir.com.br"
+SMTP_SERVER = "smtp.office365.com"
+SMTP_PORT = 587
 
 REQUIRED_VL06_COLUMNS = [
     "Nº transporte",
@@ -29,6 +39,9 @@ REQUIRED_VL06_COLUMNS = [
 ]
 
 
+# =========================
+# ESTADO
+# =========================
 def init_state():
     defaults = {
         "base_vl06": None,
@@ -42,6 +55,9 @@ def init_state():
             st.session_state[key] = value
 
 
+# =========================
+# FUNÇÕES UTILITÁRIAS
+# =========================
 def clean_str(value):
     if pd.isna(value):
         return ""
@@ -71,7 +87,6 @@ def to_int_qty(value):
     if not text:
         return 0
     text = text.replace(" ", "")
-    # trata formatos como 1.200,00 e 1200.00
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
     elif "," in text:
@@ -82,6 +97,9 @@ def to_int_qty(value):
         return 0
 
 
+# =========================
+# NORMALIZAÇÃO DA VL06
+# =========================
 def normalize_vl06(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -104,11 +122,22 @@ def normalize_vl06(df_raw: pd.DataFrame) -> pd.DataFrame:
         "volume": df["Volume"].apply(to_int_qty),
     })
 
-    data = data[(data["dt"] != "") & (data["material"] != "")].copy()
+    # Ignora linhas sem DT, sem material e com quantidade 0
+    data = data[
+        (data["dt"] != "") &
+        (data["material"] != "") &
+        (data["qtd_solicitada"] > 0)
+    ].copy()
+
+    # Mantém remessas distintas dentro da mesma DT
+    data = data.drop_duplicates(
+        subset=["dt", "remessa", "doc_referencia", "material", "descricao", "qtd_solicitada"]
+    ).reset_index(drop=True)
+
     data["qtd_conferida"] = 0
     data["status_item"] = "PENDENTE"
     data["status_dt"] = "PENDENTE"
-    return data.reset_index(drop=True)
+    return data
 
 
 def normalize_sku_base(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -144,6 +173,9 @@ def normalize_sku_base(df_raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# =========================
+# STATUS
+# =========================
 def compute_item_status(qtd_conferida: int, qtd_solicitada: int) -> str:
     if qtd_conferida == 0:
         return "PENDENTE"
@@ -163,6 +195,9 @@ def apply_statuses(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# =========================
+# SNAPSHOT
+# =========================
 def get_dt_list():
     base = st.session_state["base_vl06"]
     if base is None or base.empty:
@@ -193,6 +228,7 @@ def get_dt_snapshot(dt: str):
             "status_dt": "PENDENTE",
             "cliente": clean_str(df_dt["cliente"].iloc[0]),
             "transportadora": clean_str(df_dt["transportadora"].iloc[0]),
+            "qtd_remessas": int(df_dt["remessa"].nunique()),
         },
         "items": apply_statuses(df_dt).to_dict(orient="records"),
     }
@@ -204,14 +240,6 @@ def save_dt_snapshot(dt: str, snapshot: dict):
     st.session_state["conferencias"][dt] = snapshot
 
 
-def dt_locked(snapshot: dict) -> bool:
-    return snapshot["meta"].get("status_dt") == "FINALIZADO"
-
-
-def dt_can_reopen(snapshot: dict) -> bool:
-    return snapshot["meta"].get("status_dt") == "DIVERGENTE"
-
-
 def snapshot_to_df(snapshot: dict) -> pd.DataFrame:
     return pd.DataFrame(snapshot["items"])
 
@@ -220,6 +248,14 @@ def update_snapshot_items(dt: str, df_items: pd.DataFrame):
     snapshot = deepcopy(st.session_state["conferencias"][dt])
     snapshot["items"] = apply_statuses(df_items).to_dict(orient="records")
     save_dt_snapshot(dt, snapshot)
+
+
+def dt_locked(snapshot: dict) -> bool:
+    return snapshot["meta"].get("status_dt") == "FINALIZADO"
+
+
+def dt_can_reopen(snapshot: dict) -> bool:
+    return snapshot["meta"].get("status_dt") == "DIVERGENTE"
 
 
 def mark_dt_started(dt: str, conferente: str, turno: str):
@@ -252,15 +288,16 @@ def reopen_dt(dt: str):
         save_dt_snapshot(dt, snapshot)
 
 
+# =========================
+# GESTÃO
+# =========================
 def build_management_df():
     base = st.session_state["base_vl06"]
     if base is None or base.empty:
         return pd.DataFrame()
 
-    dts = get_dt_list()
     rows = []
-
-    for dt in dts:
+    for dt in get_dt_list():
         snapshot = get_dt_snapshot(dt)
         items_df = snapshot_to_df(snapshot)
         meta = snapshot["meta"]
@@ -269,6 +306,7 @@ def build_management_df():
             "DT": dt,
             "Cliente": meta.get("cliente", ""),
             "Transportadora": meta.get("transportadora", ""),
+            "Remessas": int(items_df["remessa"].nunique()) if not items_df.empty else 0,
             "Conferente": meta.get("conferente", ""),
             "Turno": meta.get("turno", ""),
             "Início": meta.get("inicio", ""),
@@ -283,14 +321,26 @@ def build_management_df():
     return pd.DataFrame(rows)
 
 
+# =========================
+# PDF E E-MAIL
+# =========================
 def generate_pdf_bytes(snapshot: dict) -> bytes:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=18,
+        rightMargin=18,
+        topMargin=18,
+        bottomMargin=18
+    )
+
     styles = getSampleStyleSheet()
     story = []
 
     meta = snapshot["meta"]
-    items_df = snapshot_to_df(snapshot)
+    items_df = snapshot_to_df(snapshot).copy()
+    items_df = items_df.sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
     story.append(Paragraph(f"Espelho de Conferência - DT {meta.get('dt', '')}", styles["Title"]))
     story.append(Spacer(1, 8))
@@ -301,15 +351,15 @@ def generate_pdf_bytes(snapshot: dict) -> bytes:
     story.append(Paragraph(f"Turno: {meta.get('turno', '')}", styles["Normal"]))
     story.append(Paragraph(f"Início: {meta.get('inicio', '')}", styles["Normal"]))
     story.append(Paragraph(f"Fim: {meta.get('fim', '')}", styles["Normal"]))
+    story.append(Paragraph(f"Quantidade de remessas: {int(items_df['remessa'].nunique())}", styles["Normal"]))
     story.append(Spacer(1, 10))
 
-    view_cols = [
-        "remessa", "doc_referencia", "material", "descricao",
-        "qtd_solicitada", "qtd_conferida", "status_item"
-    ]
-    table_data = [["Remessa", "Doc. Ref.", "Material", "Descrição", "Qtd Solicitada", "Qtd Conferida", "Status"]]
+    table_data = [[
+        "Remessa", "Doc. Ref.", "Material", "Descrição",
+        "Qtd Solicitada", "Qtd Conferida", "Status"
+    ]]
 
-    for _, row in items_df[view_cols].iterrows():
+    for _, row in items_df.iterrows():
         table_data.append([
             str(row["remessa"]),
             str(row["doc_referencia"]),
@@ -328,13 +378,38 @@ def generate_pdf_bytes(snapshot: dict) -> bytes:
         ("FONTSIZE", (0, 0), (-1, -1), 8),
         ("LEADING", (0, 0), (-1, -1), 10),
     ]))
-    story.append(table)
 
+    story.append(table)
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
 
 
+def send_pdf_email(pdf_bytes: bytes, filename: str, dt: str, status_dt: str):
+    msg = EmailMessage()
+    msg["Subject"] = f"Conferência DT {dt} - {status_dt}"
+    msg["From"] = EMAIL_REMETENTE
+    msg["To"] = EMAIL_DESTINO
+    msg.set_content(
+        f"Segue em anexo o PDF da conferência.\n\nDT: {dt}\nStatus: {status_dt}"
+    )
+
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=filename
+    )
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+        smtp.starttls()
+        smtp.login(EMAIL_REMETENTE, EMAIL_SENHA)
+        smtp.send_message(msg)
+
+
+# =========================
+# SNAPSHOT JSON
+# =========================
 def export_snapshot_json() -> bytes:
     payload = {
         "base_vl06": st.session_state["base_vl06"].to_dict(orient="records") if st.session_state["base_vl06"] is not None else [],
@@ -355,6 +430,9 @@ def import_snapshot_json(file):
     st.session_state["conferencias"] = conferencias
 
 
+# =========================
+# SIDEBAR
+# =========================
 def render_sidebar():
     st.sidebar.title("Menu")
     section = st.sidebar.radio("Acesso", ["Assistente", "Conferência", "Gestão"])
@@ -378,6 +456,9 @@ def render_sidebar():
     return section
 
 
+# =========================
+# PÁGINAS
+# =========================
 def page_assistente():
     st.title("📤 Assistente de Logística")
 
@@ -433,16 +514,11 @@ def page_assistente():
     if st.session_state["base_vl06"] is not None:
         base = st.session_state["base_vl06"]
         st.subheader("Resumo da base atual")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Linhas VL06", len(base))
-        c2.metric("DTs", base["dt"].nunique())
-        c3.metric("Materiais", base["material"].nunique())
-
+        a, b, c = st.columns(3)
+        a.metric("Linhas válidas", len(base))
+        b.metric("DTs", base["dt"].nunique())
+        c.metric("Remessas", base["remessa"].nunique())
         st.dataframe(base.head(50), use_container_width=True)
-
-    if st.session_state["sku_base"] is not None:
-        st.subheader("Resumo da base SKU")
-        st.dataframe(st.session_state["sku_base"].head(50), use_container_width=True)
 
 
 def page_conferencia():
@@ -453,47 +529,42 @@ def page_conferencia():
         return
 
     dt_list = get_dt_list()
-    if not dt_list:
-        st.warning("Não há DTs disponíveis.")
-        return
-
     search = st.text_input("Pesquisar DT")
     filtered = [d for d in dt_list if search.strip() in d] if search.strip() else dt_list
+
     if not filtered:
         st.warning("Nenhuma DT encontrada.")
         return
 
     dt = st.selectbox("Selecione a DT", filtered)
     snapshot = get_dt_snapshot(dt)
-
     meta = snapshot["meta"]
 
-    top1, top2, top3 = st.columns(3)
+    top1, top2, top3, top4 = st.columns(4)
     top1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
     top2.info(f"**Transportadora**\n\n{meta.get('transportadora', '')}")
     top3.info(f"**Status DT**\n\n{meta.get('status_dt', 'PENDENTE')}")
+    top4.info(f"**Remessas na DT**\n\n{meta.get('qtd_remessas', 0)}")
 
     c1, c2, c3, c4 = st.columns(4)
     conferente = c1.text_input("Conferente", value=meta.get("conferente", ""), key=f"conf_{dt}")
     turno = c2.selectbox("Turno", ["Manhã", "Tarde", "Noite"], index=["Manhã", "Tarde", "Noite"].index(meta.get("turno", "Manhã")), key=f"turno_{dt}")
-    inicio_atual = meta.get("inicio", "")
-    fim_atual = meta.get("fim", "")
-    c3.text_input("Início", value=inicio_atual, disabled=True, key=f"inicio_{dt}")
-    c4.text_input("Fim", value=fim_atual, disabled=True, key=f"fim_{dt}")
+    c3.text_input("Início", value=meta.get("inicio", ""), disabled=True, key=f"inicio_{dt}")
+    c4.text_input("Fim", value=meta.get("fim", ""), disabled=True, key=f"fim_{dt}")
 
     snapshot["meta"]["conferente"] = conferente
     snapshot["meta"]["turno"] = turno
     save_dt_snapshot(dt, snapshot)
 
     if dt_locked(snapshot):
-        st.error("Esta DT foi finalizada sem divergência e está bloqueada para reabertura.")
+        st.error("Esta DT foi finalizada sem divergência e está bloqueada.")
     elif meta.get("status_dt") == "DIVERGENTE":
         st.warning("Esta DT foi finalizada com divergência e pode ser reaberta na Gestão.")
     else:
         mark_dt_started(dt, conferente, turno)
 
     items_df = snapshot_to_df(get_dt_snapshot(dt))
-    items_df = apply_statuses(items_df)
+    items_df = apply_statuses(items_df).sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
     st.subheader("Lançamento por palete")
     sku_base = st.session_state["sku_base"]
@@ -501,7 +572,7 @@ def page_conferencia():
     if sku_base is not None and not sku_base.empty:
         sku_map = dict(zip(sku_base["sku"].astype(str), sku_base["qtd_palete"].astype(int)))
 
-    col_a, col_b, col_c = st.columns([2, 1, 1])
+    col_a, col_b = st.columns([3, 1])
     codigo_bip = col_a.text_input("Bipar SKU", key=f"bip_{dt}")
     if col_b.button("Lançar palete", key=f"btn_bip_{dt}", disabled=dt_locked(get_dt_snapshot(dt))):
         if not codigo_bip:
@@ -545,7 +616,7 @@ def page_conferencia():
         editor_df,
         hide_index=True,
         use_container_width=True,
-        disabled=["remessa", "doc_referencia", "material", "descricao", "qtd_solicitada", "status_item"] if dt_locked(get_dt_snapshot(dt)) else ["remessa", "doc_referencia", "material", "descricao", "qtd_solicitada", "status_item"],
+        disabled=["remessa", "doc_referencia", "material", "descricao", "qtd_solicitada", "status_item"],
         column_config={
             "remessa": "Remessa",
             "doc_referencia": "Documento referência",
@@ -562,18 +633,21 @@ def page_conferencia():
     items_df = apply_statuses(items_df)
     update_snapshot_items(dt, items_df)
 
-    c_ok, c_div, c_pen = st.columns(3)
-    c_ok.metric("Itens OK", int((items_df["status_item"] == "OK").sum()))
-    c_div.metric("Itens divergentes", int((items_df["status_item"] == "DIVERGENTE").sum()))
-    c_pen.metric("Itens pendentes", int((items_df["status_item"] == "PENDENTE").sum()))
+    ok_count = int((items_df["status_item"] == "OK").sum())
+    div_count = int((items_df["status_item"] == "DIVERGENTE").sum())
+    pen_count = int((items_df["status_item"] == "PENDENTE").sum())
 
-    has_divergence = (items_df["status_item"] == "DIVERGENTE").any()
+    c_ok, c_div, c_pen = st.columns(3)
+    c_ok.metric("Itens OK", ok_count)
+    c_div.metric("Itens divergentes", div_count)
+    c_pen.metric("Itens pendentes", pen_count)
+
+    has_divergence = div_count > 0
 
     b1, b2, b3 = st.columns(3)
 
     if b1.button("Gerar PDF", key=f"pdf_{dt}"):
-        snapshot = get_dt_snapshot(dt)
-        pdf_bytes = generate_pdf_bytes(snapshot)
+        pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
         st.session_state["last_pdf_bytes"] = pdf_bytes
         st.session_state["last_pdf_name"] = f"espelho_dt_{dt}.pdf"
         st.success("PDF gerado.")
@@ -595,14 +669,24 @@ def page_conferencia():
             pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
             st.session_state["last_pdf_bytes"] = pdf_bytes
             st.session_state["last_pdf_name"] = f"espelho_dt_{dt}.pdf"
-            st.success("Conferência finalizada sem divergência.")
+
+            try:
+                send_pdf_email(pdf_bytes, f"espelho_dt_{dt}.pdf", dt, "FINALIZADO")
+                st.success("Conferência finalizada e PDF enviado por e-mail.")
+            except Exception as e:
+                st.warning(f"Conferência finalizada, mas houve erro no envio do e-mail: {e}")
 
     if b3.button("Finalizar com divergência", key=f"final_div_{dt}", disabled=dt_locked(get_dt_snapshot(dt))):
         finalize_dt(dt, "DIVERGENTE", conferente, turno)
         pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
         st.session_state["last_pdf_bytes"] = pdf_bytes
         st.session_state["last_pdf_name"] = f"espelho_dt_{dt}.pdf"
-        st.warning("Conferência finalizada com divergência.")
+
+        try:
+            send_pdf_email(pdf_bytes, f"espelho_dt_{dt}.pdf", dt, "DIVERGENTE")
+            st.warning("Conferência finalizada com divergência e PDF enviado por e-mail.")
+        except Exception as e:
+            st.warning(f"Conferência finalizada com divergência, mas houve erro no envio do e-mail: {e}")
 
 
 def page_gestao():
@@ -613,19 +697,13 @@ def page_gestao():
         return
 
     mgmt = build_management_df()
-    if mgmt.empty:
-        st.warning("Sem dados para gestão.")
-        return
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total DTs", len(mgmt))
     c2.metric("Pendentes", int((mgmt["Status DT"] == "PENDENTE").sum()))
     c3.metric("Em andamento", int((mgmt["Status DT"] == "EM_ANDAMENTO").sum()))
     c4.metric("Finalizadas", int((mgmt["Status DT"] == "FINALIZADO").sum()))
-
-    c5, c6 = st.columns(2)
     c5.metric("Divergentes", int((mgmt["Status DT"] == "DIVERGENTE").sum()))
-    c6.metric("Conferentes ativos", mgmt["Conferente"].replace("", pd.NA).dropna().nunique())
 
     filtro_status = st.selectbox("Filtrar por status", ["Todos", "PENDENTE", "EM_ANDAMENTO", "FINALIZADO", "DIVERGENTE"])
     show_df = mgmt.copy()
@@ -635,9 +713,8 @@ def page_gestao():
     st.subheader("Fila de DTs")
     st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Reabrir conferência")
     dts_div = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist()
-
+    st.subheader("Reabrir conferência")
     if not dts_div:
         st.info("Não há DTs divergentes para reabrir.")
         return
@@ -653,6 +730,9 @@ def page_gestao():
             st.error("Só é permitido reabrir DT com status divergente.")
 
 
+# =========================
+# EXECUÇÃO
+# =========================
 init_state()
 section = render_sidebar()
 
