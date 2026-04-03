@@ -19,7 +19,7 @@ st.set_page_config(layout="wide", page_title="Conferência VL06")
 # CONFIG E-MAIL
 # =========================
 EMAIL_REMETENTE = "wellington.feitosa@nadir.com.br"
-EMAIL_SENHA = "SUA_SENHA_OU_SENHA_DE_APP"
+EMAIL_SENHA = "Nadir@36"
 EMAIL_DESTINO = "wellington.feitosa@nadir.com.br"
 SMTP_SERVER = "smtp.office365.com"
 SMTP_PORT = 587
