@@ -8,48 +8,72 @@ st.title("📤 Carregar VL06")
 arquivo = st.file_uploader("Selecione o arquivo VL06", type=["xlsx"])
 
 if arquivo:
+    try:
+        df = pd.read_excel(arquivo)
 
-    df = pd.read_excel(arquivo)
+        # Limpa espaços extras nos nomes das colunas
+        df.columns = df.columns.str.strip()
 
-    conn = sqlite3.connect("banco.db")
+        st.success("Arquivo carregado com sucesso!")
 
-    registros = 0
+        st.subheader("Colunas encontradas no arquivo")
+        st.write(df.columns.tolist())
 
-    for _, row in df.iterrows():
+        conn = sqlite3.connect("banco.db")
 
-        try:
-            dt = str(row["Nº transporte"]).strip()
-            remessa = str(row["Remessa"]).strip()
-            material = str(row["Material"]).strip()
-            descricao = str(row["Denominação de item"]).strip()
-            cliente = str(row["Nome do emissor da ordem"]).strip()
-            perfil = str(row["Nome agente de frete"]).strip()
+        registros = 0
 
-            # 🔧 TRATAR QUANTIDADE
-            qtd = row["Qtd.remessa"]
+        for _, row in df.iterrows():
+            try:
+                dt = str(row.get("Nº transporte", "")).strip()
+                remessa = str(row.get("Remessa", "")).strip()
+                material = str(row.get("Material", "")).strip()
+                descricao = str(row.get("Denominação de item", "")).strip()
+                cliente = str(row.get("Nome do emissor da ordem", "")).strip()
+                perfil = str(row.get("Nome agente de frete", "")).strip()
 
-            if pd.isna(qtd):
-                qtd = 0
-            else:
-                qtd = str(qtd).replace(".", "").replace(",", ".")
-                qtd = int(float(qtd))
+                qtd = row.get("Qtd.remessa", 0)
 
-            if not dt or not material:
+                if pd.isna(qtd):
+                    qtd = 0
+                else:
+                    qtd = str(qtd).strip().replace(".", "").replace(",", ".")
+                    qtd = int(float(qtd))
+
+                # Ignora linhas sem DT ou Material
+                if not dt or dt.lower() == "nan" or not material or material.lower() == "nan":
+                    continue
+
+                conn.execute("""
+                    INSERT INTO cargas (
+                        dt,
+                        remessa,
+                        material,
+                        descricao,
+                        qtd_solicitada,
+                        cliente,
+                        perfil
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    dt,
+                    remessa,
+                    material,
+                    descricao,
+                    qtd,
+                    cliente,
+                    perfil
+                ))
+
+                registros += 1
+
+            except Exception as e:
+                st.warning(f"Linha ignorada por erro: {e}")
                 continue
 
-            conn.execute("""
-            INSERT INTO cargas (
-                dt, remessa, material, descricao, qtd_solicitada,
-                cliente, perfil
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (dt, remessa, material, descricao, qtd, cliente, perfil))
+        conn.commit()
+        conn.close()
 
-            registros += 1
+        st.success(f"✅ {registros} registros inseridos!")
 
-        except:
-            continue
-
-    conn.commit()
-    conn.close()
-
-    st.success(f"✅ {registros} registros inseridos!")
+    except Exception as e:
+        st.error(f"Erro ao processar o arquivo: {e}")
