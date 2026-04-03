@@ -3,8 +3,10 @@ import sqlite3
 conn = sqlite3.connect("banco.db")
 cursor = conn.cursor()
 
+cursor.execute("DROP TABLE IF EXISTS cargas")
+
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS cargas (
+CREATE TABLE cargas (
     dt TEXT,
     remessa TEXT,
     material TEXT,
@@ -12,21 +14,12 @@ CREATE TABLE IF NOT EXISTS cargas (
     qtd_solicitada INTEGER,
     qtd_conferida INTEGER DEFAULT 0,
     status TEXT DEFAULT 'PENDENTE',
-    conferente TEXT,
+    cliente TEXT,
+    perfil TEXT,
     inicio TEXT,
     fim TEXT
 )
 """)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS cadastro_sku (
-    sku TEXT,
-    descricao TEXT,
-    qtd_palete INTEGER
-)
-""")
-
 conn.commit()
 conn.close()
-
-print("Banco criado com sucesso!")
