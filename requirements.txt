@@ -6,3 +6,5 @@ resend
 filelock
 plotly
 Cloudinary
+reportlab
+pytz
