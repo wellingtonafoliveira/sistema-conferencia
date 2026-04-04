@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import tempfile
@@ -11,7 +10,6 @@ import cloudinary
 import cloudinary.uploader
 import pandas as pd
 import plotly.express as px
-import resend
 import streamlit as st
 from filelock import FileLock
 from reportlab.lib import colors, utils
@@ -19,14 +17,8 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import (
-    Image,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
 
 # =========================================================
 # CONFIG
@@ -55,10 +47,6 @@ REQUIRED_VL06_COLUMNS = [
     "Perfil de carregamento",
     "Tipo de carga",
 ]
-
-resend.api_key = st.secrets["resend"]["api_key"]
-EMAIL_FROM = st.secrets["email"]["from_email"]
-EMAIL_TO = st.secrets["email"]["to_email"]
 
 cloudinary.config(
     cloud_name=st.secrets["cloudinary"]["cloud_name"],
@@ -96,7 +84,7 @@ def info_card(label, value):
                 {label}
             </div>
             <div style="font-size: 18px; color: #0f172a; font-weight: 700;">
-                {value if value not in [None, ''] else '-'}
+                {value if value not in [None, ""] else "-"}
             </div>
         </div>
         """,
@@ -440,14 +428,11 @@ def get_dt_snapshot(dt):
     confs = get_conferencias()
     if dt in confs:
         snapshot = confs[dt]
-        if "pdf_url" not in snapshot["meta"]:
-            snapshot["meta"]["pdf_url"] = ""
-        if "pdf_public_id" not in snapshot["meta"]:
-            snapshot["meta"]["pdf_public_id"] = ""
-        if "assinatura_conferente" not in snapshot["meta"]:
-            snapshot["meta"]["assinatura_conferente"] = ""
-        if "assinatura_lider" not in snapshot["meta"]:
-            snapshot["meta"]["assinatura_lider"] = ""
+        meta = snapshot.setdefault("meta", {})
+        meta.setdefault("pdf_url", "")
+        meta.setdefault("pdf_public_id", "")
+        meta.setdefault("assinatura_conferente", "")
+        meta.setdefault("assinatura_lider", "")
         return snapshot
 
     base = get_base_vl06_df()
@@ -498,10 +483,12 @@ def snapshot_to_df(snapshot):
 def update_snapshot_items(dt, df_items):
     snapshot = deepcopy(get_dt_snapshot(dt))
     snapshot["items"] = apply_statuses(df_items).to_dict(orient="records")
-
     snapshot["meta"]["total_caixas"] = int(pd.to_numeric(df_items["qtd_solicitada"], errors="coerce").fillna(0).sum())
+
     if "metragem_cubica" in df_items.columns:
-        snapshot["meta"]["metragem_cubica"] = float(pd.to_numeric(df_items["metragem_cubica"], errors="coerce").fillna(0).sum())
+        snapshot["meta"]["metragem_cubica"] = float(
+            pd.to_numeric(df_items["metragem_cubica"], errors="coerce").fillna(0).sum()
+        )
 
     save_dt_snapshot(dt, snapshot)
 
@@ -540,12 +527,34 @@ def finalize_dt(dt, final_status, conferente, turno, assinatura_conferente="", a
     save_dt_snapshot(dt, snapshot)
 
 
+def reset_dt_conferencia(dt):
+    snapshot = deepcopy(get_dt_snapshot(dt))
+    items_df = snapshot_to_df(snapshot)
+
+    if items_df.empty:
+        return
+
+    items_df["qtd_conferida"] = 0
+    items_df["status_item"] = "PENDENTE"
+
+    snapshot["items"] = items_df.to_dict(orient="records")
+    snapshot["meta"]["inicio"] = ""
+    snapshot["meta"]["fim"] = ""
+    snapshot["meta"]["status_dt"] = "PENDENTE"
+    snapshot["meta"]["conferente"] = ""
+    snapshot["meta"]["turno"] = "Manhã"
+    snapshot["meta"]["pdf_url"] = ""
+    snapshot["meta"]["pdf_public_id"] = ""
+    snapshot["meta"]["assinatura_conferente"] = ""
+    snapshot["meta"]["assinatura_lider"] = ""
+
+    save_dt_snapshot(dt, snapshot)
+
+
 def reopen_dt(dt):
     snapshot = deepcopy(get_dt_snapshot(dt))
     if snapshot["meta"]["status_dt"] == "DIVERGENTE":
-        snapshot["meta"]["status_dt"] = "EM_ANDAMENTO"
-        snapshot["meta"]["fim"] = ""
-        save_dt_snapshot(dt, snapshot)
+        reset_dt_conferencia(dt)
 
 
 # =========================================================
@@ -574,7 +583,7 @@ def upload_pdf_to_cloudinary(pdf_bytes, filename, folder="espelhos_conferencia")
 
 
 # =========================================================
-# PDF + EMAIL
+# PDF
 # =========================================================
 def get_image_dimensions(path, width=None, height=None):
     img = utils.ImageReader(path)
@@ -733,10 +742,7 @@ def generate_pdf_bytes(snapshot):
     assinatura_lider = meta.get("assinatura_lider", "")
 
     signature_table = Table([
-        [
-            "",
-            "",
-        ],
+        ["", ""],
         [
             f"________________________________________<br/>{assinatura_conferente}<br/>Assinatura do Conferente",
             f"________________________________________<br/>{assinatura_lider}<br/>Assinatura da Liderança / Responsável",
@@ -760,32 +766,6 @@ def generate_pdf_bytes(snapshot):
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
-
-
-def send_pdf_email(pdf_bytes, filename, dt, status_dt, pdf_url=""):
-    attachment_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    link_html = f'<p><a href="{pdf_url}" target="_blank">Abrir PDF salvo online</a></p>' if pdf_url else ""
-
-    params = {
-        "from": EMAIL_FROM,
-        "to": [EMAIL_TO],
-        "subject": f"Conferência DT {dt} - {status_dt}",
-        "html": f"""
-            <strong>Conferência finalizada</strong>
-            <p><strong>DT:</strong> {dt}</p>
-            <p><strong>Status:</strong> {status_dt}</p>
-            {link_html}
-        """,
-        "attachments": [
-            {
-                "filename": filename,
-                "content": attachment_b64,
-            }
-        ],
-    }
-
-    return resend.Emails.send(params)
 
 
 # =========================================================
@@ -976,7 +956,7 @@ def page_assistente():
                 snapshot = get_dt_snapshot(dt_refazer)
                 if dt_can_reopen(snapshot):
                     reopen_dt(dt_refazer)
-                    st.success(f"DT {dt_refazer} liberada para refazer conferência.")
+                    st.success(f"DT {dt_refazer} reaberta com conferência zerada. Pronta para iniciar do zero.")
                     st.rerun()
                 else:
                     st.error("Apenas DTs divergentes podem ser refeitas.")
@@ -1223,11 +1203,10 @@ def page_conferencia():
                 snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
                 save_dt_snapshot(dt, snapshot_final)
 
-                send_pdf_email(pdf_bytes, file_name, dt, "FINALIZADO", cloud_result["url"])
-                st.success("Conferência finalizada, PDF salvo online e enviado por e-mail.")
+                st.success("Conferência finalizada e PDF salvo online com sucesso.")
                 st.rerun()
             except Exception as e:
-                st.warning(f"Conferência finalizada, mas houve erro ao salvar/enviar PDF: {e}")
+                st.warning(f"Conferência finalizada, mas houve erro ao salvar o PDF online: {e}")
 
     if b3.button("Finalizar com divergência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_div_{dt}"):
         finalize_dt(
@@ -1252,11 +1231,10 @@ def page_conferencia():
             snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
             save_dt_snapshot(dt, snapshot_final)
 
-            send_pdf_email(pdf_bytes, file_name, dt, "DIVERGENTE", cloud_result["url"])
-            st.warning("Conferência finalizada com divergência, PDF salvo online e enviado por e-mail.")
+            st.warning("Conferência finalizada com divergência e PDF salvo online.")
             st.rerun()
         except Exception as e:
-            st.warning(f"Conferência finalizada com divergência, mas houve erro ao salvar/enviar PDF: {e}")
+            st.warning(f"Conferência finalizada com divergência, mas houve erro ao salvar o PDF online: {e}")
 
 
 def page_gestao():
@@ -1357,7 +1335,7 @@ def page_gestao():
         snapshot = get_dt_snapshot(dt_reopen)
         if dt_can_reopen(snapshot):
             reopen_dt(dt_reopen)
-            st.success(f"DT {dt_reopen} reaberta com sucesso.")
+            st.success(f"DT {dt_reopen} reaberta e zerada com sucesso.")
             st.rerun()
         else:
             st.error("Só é permitido reabrir DT com status divergente.")
