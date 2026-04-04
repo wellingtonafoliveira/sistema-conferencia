@@ -23,6 +23,7 @@ st.set_page_config(page_title="Sistema de Conferência", layout="wide")
 
 DATA_FILE = "data_store.json"
 LOCK_FILE = "data_store.lock"
+LOGO_FILE = "Nadir_Branco_Laranja.png"
 
 REQUIRED_VL06_COLUMNS = [
     "Nº transporte",
@@ -45,6 +46,19 @@ REQUIRED_VL06_COLUMNS = [
 resend.api_key = st.secrets["resend"]["api_key"]
 EMAIL_FROM = st.secrets["email"]["from_email"]
 EMAIL_TO = st.secrets["email"]["to_email"]
+
+
+# =========================================================
+# HELPERS UI
+# =========================================================
+def show_logo_main(width=220):
+    if os.path.exists(LOGO_FILE):
+        st.image(LOGO_FILE, width=width)
+
+
+def show_logo_sidebar():
+    if os.path.exists(LOGO_FILE):
+        st.sidebar.image(LOGO_FILE, use_container_width=True)
 
 
 # =========================================================
@@ -76,7 +90,13 @@ def save_store(data):
 # AUTH
 # =========================================================
 def login_screen():
-    st.title("Acesso ao Sistema")
+    col_logo, col_title = st.columns([1, 3])
+
+    with col_logo:
+        show_logo_main(width=180)
+
+    with col_title:
+        st.title("Acesso ao Sistema")
 
     usuario = st.text_input("Usuário")
     senha = st.text_input("Senha", type="password")
@@ -555,6 +575,7 @@ def build_management_df():
 # PÁGINAS
 # =========================================================
 def page_assistente():
+    show_logo_main()
     st.title("Assistente de Logística")
 
     col1, col2 = st.columns(2)
@@ -633,6 +654,7 @@ def page_assistente():
 
 
 def page_conferencia():
+    show_logo_main()
     st.title("Conferência")
 
     base = get_base_vl06_df()
@@ -828,6 +850,7 @@ def page_conferencia():
 
 
 def page_gestao():
+    show_logo_main()
     st.title("Gestão")
 
     base = get_base_vl06_df()
@@ -840,7 +863,6 @@ def page_gestao():
         st.warning("Sem dados.")
         return
 
-    # KPIs
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total DTs", len(mgmt))
     c2.metric("Pendentes", int((mgmt["Status DT"] == "PENDENTE").sum()))
@@ -920,6 +942,7 @@ if not st.session_state.get("auth_ok"):
     login_screen()
     st.stop()
 
+show_logo_sidebar()
 st.sidebar.success(f"Usuário: {st.session_state['usuario']}")
 st.sidebar.info(f"Perfil: {st.session_state['perfil']}")
 
