@@ -1,19 +1,26 @@
 import base64
 import json
 import os
+import tempfile
 from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
 import pandas as pd
 import plotly.express as px
 import resend
 import streamlit as st
 from filelock import FileLock
-from reportlab.lib import colors
+from reportlab.lib import colors, utils
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 # =========================================================
@@ -24,6 +31,7 @@ st.set_page_config(page_title="Sistema de Conferência", layout="wide")
 DATA_FILE = "data_store.json"
 LOCK_FILE = "data_store.lock"
 LOGO_FILE = "Nadir_Branco_Laranja.png"
+APP_TZ = ZoneInfo("America/Sao_Paulo")
 
 REQUIRED_VL06_COLUMNS = [
     "Nº transporte",
@@ -47,6 +55,13 @@ resend.api_key = st.secrets["resend"]["api_key"]
 EMAIL_FROM = st.secrets["email"]["from_email"]
 EMAIL_TO = st.secrets["email"]["to_email"]
 
+cloudinary.config(
+    cloud_name=st.secrets["cloudinary"]["cloud_name"],
+    api_key=st.secrets["cloudinary"]["api_key"],
+    api_secret=st.secrets["cloudinary"]["api_secret"],
+    secure=True,
+)
+
 
 # =========================================================
 # HELPERS UI
@@ -59,6 +74,69 @@ def show_logo_main(width=220):
 def show_logo_sidebar():
     if os.path.exists(LOGO_FILE):
         st.sidebar.image(LOGO_FILE, use_container_width=True)
+
+
+def info_card(label, value):
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
+            border: 1px solid #fed7aa;
+            border-radius: 14px;
+            padding: 14px 16px;
+            min-height: 95px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        ">
+            <div style="font-size: 12px; color: #9a3412; font-weight: 600; margin-bottom: 6px;">
+                {label}
+            </div>
+            <div style="font-size: 18px; color: #431407; font-weight: 700;">
+                {value if value not in [None, ''] else '-'}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================================================
+# TIME
+# =========================================================
+def now_sp():
+    return datetime.now(APP_TZ)
+
+
+def now_sp_str():
+    return now_sp().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def now_sp_file():
+    return now_sp().strftime("%Y%m%d_%H%M%S")
+
+
+def parse_br_datetime(text):
+    if not text:
+        return None
+    try:
+        return datetime.strptime(str(text), "%d/%m/%Y %H:%M:%S").replace(tzinfo=APP_TZ)
+    except Exception:
+        return None
+
+
+def calc_duration_minutes(inicio, fim):
+    dt_ini = parse_br_datetime(inicio)
+    dt_fim = parse_br_datetime(fim)
+    if not dt_ini or not dt_fim:
+        return 0
+    seconds = (dt_fim - dt_ini).total_seconds()
+    return max(int(seconds / 60), 0)
+
+
+def format_duration_hhmm(total_minutes):
+    total_minutes = int(total_minutes or 0)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours:02d}:{minutes:02d}"
 
 
 # =========================================================
@@ -97,6 +175,7 @@ def login_screen():
 
     with col_title:
         st.title("Acesso ao Sistema")
+        st.caption("Sistema de Conferência Operacional")
 
     usuario = st.text_input("Usuário")
     senha = st.text_input("Senha", type="password")
@@ -207,9 +286,11 @@ def format_time_only(value):
     text = clean_str(value)
     if not text:
         return ""
+
     dt = pd.to_datetime(value, errors="coerce")
     if pd.notna(dt):
         return dt.strftime("%H:%M")
+
     return text
 
 
@@ -223,8 +304,8 @@ def compute_item_status(qtd_conferida, qtd_solicitada):
 
 def apply_statuses(df):
     out = df.copy()
-    out["qtd_conferida"] = out["qtd_conferida"].fillna(0).astype(int)
-    out["qtd_solicitada"] = out["qtd_solicitada"].fillna(0).astype(int)
+    out["qtd_conferida"] = pd.to_numeric(out["qtd_conferida"], errors="coerce").fillna(0).astype(int)
+    out["qtd_solicitada"] = pd.to_numeric(out["qtd_solicitada"], errors="coerce").fillna(0).astype(int)
     out["status_item"] = out.apply(
         lambda row: compute_item_status(row["qtd_conferida"], row["qtd_solicitada"]),
         axis=1,
@@ -353,7 +434,12 @@ def get_dt_list():
 def get_dt_snapshot(dt):
     confs = get_conferencias()
     if dt in confs:
-        return confs[dt]
+        snapshot = confs[dt]
+        if "pdf_url" not in snapshot["meta"]:
+            snapshot["meta"]["pdf_url"] = ""
+        if "pdf_public_id" not in snapshot["meta"]:
+            snapshot["meta"]["pdf_public_id"] = ""
+        return snapshot
 
     base = get_base_vl06_df()
     df_dt = base[base["dt"] == dt].copy()
@@ -377,6 +463,8 @@ def get_dt_snapshot(dt):
             "tipo_carga": clean_str(df_dt["tipo_carga"].iloc[0]),
             "total_caixas": int(df_dt["qtd_solicitada"].fillna(0).sum()),
             "metragem_cubica": float(df_dt["metragem_cubica"].fillna(0).sum()),
+            "pdf_url": "",
+            "pdf_public_id": "",
         },
         "items": apply_statuses(df_dt).to_dict(orient="records"),
     }
@@ -399,6 +487,11 @@ def snapshot_to_df(snapshot):
 def update_snapshot_items(dt, df_items):
     snapshot = deepcopy(get_dt_snapshot(dt))
     snapshot["items"] = apply_statuses(df_items).to_dict(orient="records")
+
+    snapshot["meta"]["total_caixas"] = int(pd.to_numeric(df_items["qtd_solicitada"], errors="coerce").fillna(0).sum())
+    if "metragem_cubica" in df_items.columns:
+        snapshot["meta"]["metragem_cubica"] = float(pd.to_numeric(df_items["metragem_cubica"], errors="coerce").fillna(0).sum())
+
     save_dt_snapshot(dt, snapshot)
 
 
@@ -413,7 +506,7 @@ def dt_can_reopen(snapshot):
 def mark_dt_started(dt, conferente, turno):
     snapshot = deepcopy(get_dt_snapshot(dt))
     if not snapshot["meta"].get("inicio"):
-        snapshot["meta"]["inicio"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        snapshot["meta"]["inicio"] = now_sp_str()
     snapshot["meta"]["conferente"] = conferente
     snapshot["meta"]["turno"] = turno
     if snapshot["meta"]["status_dt"] == "PENDENTE":
@@ -426,8 +519,8 @@ def finalize_dt(dt, final_status, conferente, turno):
     snapshot["meta"]["conferente"] = conferente
     snapshot["meta"]["turno"] = turno
     if not snapshot["meta"].get("inicio"):
-        snapshot["meta"]["inicio"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    snapshot["meta"]["fim"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        snapshot["meta"]["inicio"] = now_sp_str()
+    snapshot["meta"]["fim"] = now_sp_str()
     snapshot["meta"]["status_dt"] = final_status
     save_dt_snapshot(dt, snapshot)
 
@@ -441,45 +534,126 @@ def reopen_dt(dt):
 
 
 # =========================================================
+# CLOUDINARY
+# =========================================================
+def upload_pdf_to_cloudinary(pdf_bytes, filename, folder="espelhos_conferencia"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        temp_path = tmp.name
+
+    try:
+        result = cloudinary.uploader.upload(
+            temp_path,
+            resource_type="raw",
+            folder=folder,
+            public_id=filename.replace(".pdf", ""),
+            overwrite=True,
+        )
+        return {
+            "url": result.get("secure_url", ""),
+            "public_id": result.get("public_id", ""),
+        }
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# =========================================================
 # PDF + EMAIL
 # =========================================================
+def get_image_dimensions(path, width=None, height=None):
+    img = utils.ImageReader(path)
+    iw, ih = img.getSize()
+    if width and not height:
+        aspect = ih / float(iw)
+        height = width * aspect
+    elif height and not width:
+        aspect = iw / float(ih)
+        width = height * aspect
+    return width, height
+
+
 def generate_pdf_bytes(snapshot):
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=landscape(A4),
-        leftMargin=18,
-        rightMargin=18,
-        topMargin=18,
-        bottomMargin=18,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
     )
-    styles = getSampleStyleSheet()
-    story = []
 
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PdfTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#9A3412"),
+        spaceAfter=6,
+    )
+    subtitle_style = ParagraphStyle(
+        "PdfSubtitle",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=9,
+        textColor=colors.HexColor("#6B7280"),
+        spaceAfter=10,
+    )
+    normal_style = ParagraphStyle(
+        "PdfNormal",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        fontSize=9,
+        leading=11,
+    )
+
+    story = []
     meta = snapshot["meta"]
     items_df = snapshot_to_df(snapshot).copy().sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
-    story.append(Paragraph(f"Espelho de Conferência - DT {meta.get('dt', '')}", styles["Title"]))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(f"Status: {meta.get('status_dt', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Cliente: {meta.get('cliente', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Transportadora: {meta.get('transportadora', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Conferente: {meta.get('conferente', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Turno: {meta.get('turno', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Início: {meta.get('inicio', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Fim: {meta.get('fim', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Data agenda: {meta.get('data_agenda', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Hora agenda: {meta.get('hora_agenda', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Perfil de carregamento: {meta.get('perfil_carregamento', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Tipo de carga: {meta.get('tipo_carga', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Quantidade de remessas: {meta.get('qtd_remessas', 0)}", styles["Normal"]))
-    story.append(Paragraph(f"Total de caixas: {meta.get('total_caixas', 0)}", styles["Normal"]))
-    story.append(Paragraph(f"Metragem cúbica: {meta.get('metragem_cubica', 0):.3f} m³", styles["Normal"]))
+    if os.path.exists(LOGO_FILE):
+        w, h = get_image_dimensions(LOGO_FILE, width=42 * mm)
+        story.append(Image(LOGO_FILE, width=w, height=h))
+        story.append(Spacer(1, 2))
+
+    story.append(Paragraph("ESPELHO DE CONFERÊNCIA", title_style))
+    story.append(Paragraph("Documento operacional de conferência logística", subtitle_style))
+
+    duracao_min = calc_duration_minutes(meta.get("inicio", ""), meta.get("fim", ""))
+
+    info_table = Table([
+        ["DT", meta.get("dt", ""), "Status", meta.get("status_dt", "")],
+        ["Cliente", meta.get("cliente", ""), "Transportadora", meta.get("transportadora", "")],
+        ["Conferente", meta.get("conferente", ""), "Turno", meta.get("turno", "")],
+        ["Início", meta.get("inicio", ""), "Fim", meta.get("fim", "")],
+        ["Data agenda", meta.get("data_agenda", ""), "Hora agenda", meta.get("hora_agenda", "")],
+        ["Perfil de carregamento", meta.get("perfil_carregamento", ""), "Tipo de carga", meta.get("tipo_carga", "")],
+        ["Quantidade de remessas", str(meta.get("qtd_remessas", 0)), "Total de caixas", str(meta.get("total_caixas", 0))],
+        ["Metragem cúbica", f"{meta.get('metragem_cubica', 0):.3f} m³", "Duração", f"{duracao_min} min"],
+    ], colWidths=[42 * mm, 92 * mm, 38 * mm, 95 * mm])
+
+    info_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#D1D5DB")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FFF7ED")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#FFF7ED")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(info_table)
     story.append(Spacer(1, 10))
 
     table_data = [[
         "Remessa", "Doc. Ref.", "Material", "Descrição",
-        "Qtd Solicitada", "Qtd Conferida", "Status"
+        "Qtd Sol.", "Qtd Conf.", "Status"
     ]]
 
     for _, row in items_df.iterrows():
@@ -493,23 +667,50 @@ def generate_pdf_bytes(snapshot):
             str(row["status_item"]),
         ])
 
-    table = Table(table_data, repeatRows=1, colWidths=[70, 80, 90, 280, 80, 80, 80])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9E2F3")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("LEADING", (0, 0), (-1, -1), 10),
-    ]))
+    table = Table(
+        table_data,
+        repeatRows=1,
+        colWidths=[26 * mm, 30 * mm, 28 * mm, 104 * mm, 22 * mm, 22 * mm, 24 * mm]
+    )
 
+    style_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EA580C")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9CA3AF")),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+
+    for i, row in enumerate(table_data[1:], start=1):
+        status = row[6]
+        if i % 2 == 0:
+            style_commands.append(("BACKGROUND", (0, i), (5, i), colors.HexColor("#FAFAFA")))
+
+        if status == "OK":
+            style_commands.append(("BACKGROUND", (6, i), (6, i), colors.HexColor("#DCFCE7")))
+        elif status == "DIVERGENTE":
+            style_commands.append(("BACKGROUND", (6, i), (6, i), colors.HexColor("#FEE2E2")))
+        elif status == "PENDENTE":
+            style_commands.append(("BACKGROUND", (6, i), (6, i), colors.HexColor("#FEF3C7")))
+
+    table.setStyle(TableStyle(style_commands))
     story.append(table)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"Emitido em: {now_sp_str()}", normal_style))
+
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
 
 
-def send_pdf_email(pdf_bytes, filename, dt, status_dt):
+def send_pdf_email(pdf_bytes, filename, dt, status_dt, pdf_url=""):
     attachment_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+    link_html = f'<p><a href="{pdf_url}" target="_blank">Abrir PDF salvo online</a></p>' if pdf_url else ""
 
     params = {
         "from": EMAIL_FROM,
@@ -517,8 +718,9 @@ def send_pdf_email(pdf_bytes, filename, dt, status_dt):
         "subject": f"Conferência DT {dt} - {status_dt}",
         "html": f"""
             <strong>Conferência finalizada</strong>
-            <p>DT: {dt}</p>
-            <p>Status: {status_dt}</p>
+            <p><strong>DT:</strong> {dt}</p>
+            <p><strong>Status:</strong> {status_dt}</p>
+            {link_html}
         """,
         "attachments": [
             {
@@ -545,6 +747,11 @@ def build_management_df():
         items_df = snapshot_to_df(snapshot)
         meta = snapshot["meta"]
 
+        inicio = meta.get("inicio", "")
+        fim = meta.get("fim", "")
+        duracao_min = calc_duration_minutes(inicio, fim)
+        total_caixas = int(items_df["qtd_solicitada"].fillna(0).sum()) if not items_df.empty else 0
+
         rows.append({
             "DT": dt,
             "Cliente": meta.get("cliente", ""),
@@ -556,19 +763,87 @@ def build_management_df():
             "Remessas": int(items_df["remessa"].nunique()) if not items_df.empty else 0,
             "Conferente": meta.get("conferente", ""),
             "Turno": meta.get("turno", ""),
-            "Início": meta.get("inicio", ""),
-            "Fim": meta.get("fim", ""),
+            "Início": inicio,
+            "Fim": fim,
+            "Duração min": duracao_min,
+            "Duração HH:MM": format_duration_hhmm(duracao_min),
             "Status DT": meta.get("status_dt", "PENDENTE"),
             "Itens": len(items_df),
             "SKU únicos": items_df["material"].astype(str).nunique() if not items_df.empty else 0,
-            "Total caixas": int(items_df["qtd_solicitada"].fillna(0).sum()) if not items_df.empty else 0,
+            "Total caixas": total_caixas,
             "M³": round(float(items_df["metragem_cubica"].fillna(0).sum()), 3) if "metragem_cubica" in items_df.columns else 0,
             "OK": int((items_df["status_item"] == "OK").sum()) if not items_df.empty else 0,
             "Divergentes": int((items_df["status_item"] == "DIVERGENTE").sum()) if not items_df.empty else 0,
             "Pendentes": int((items_df["status_item"] == "PENDENTE").sum()) if not items_df.empty else 0,
+            "PDF URL": meta.get("pdf_url", ""),
         })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df["Caixas por min"] = df.apply(
+        lambda row: round(row["Total caixas"] / row["Duração min"], 2) if row["Duração min"] > 0 else 0,
+        axis=1,
+    )
+    return df
+
+
+def build_conferente_ranking(mgmt):
+    if mgmt.empty:
+        return pd.DataFrame()
+
+    df = mgmt.copy()
+    df = df[df["Conferente"].astype(str).str.strip() != ""].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    ranking = df.groupby("Conferente", dropna=False).agg(
+        DTs=("DT", "count"),
+        Total_Caixas=("Total caixas", "sum"),
+        Total_Divergencias=("Divergentes", "sum"),
+        Tempo_Total_Min=("Duração min", "sum"),
+        DTs_Finalizadas=("Status DT", lambda s: int((s == "FINALIZADO").sum())),
+        DTs_Divergentes=("Status DT", lambda s: int((s == "DIVERGENTE").sum())),
+    ).reset_index()
+
+    ranking["Produtividade"] = ranking.apply(
+        lambda row: round(row["Total_Caixas"] / row["Tempo_Total_Min"], 2) if row["Tempo_Total_Min"] > 0 else 0,
+        axis=1,
+    )
+    ranking["Tempo Total"] = ranking["Tempo_Total_Min"].apply(format_duration_hhmm)
+
+    ranking = ranking.sort_values(["Produtividade", "DTs"], ascending=[False, False]).reset_index(drop=True)
+    ranking.index = ranking.index + 1
+    ranking["Posição"] = ranking.index
+    return ranking
+
+
+def estimate_minutes_by_history(mgmt, total_caixas, metragem_cubica, tipo_carga):
+    if mgmt.empty:
+        return 0
+
+    df = mgmt.copy()
+    df = df[df["Duração min"] > 0].copy()
+    if df.empty:
+        return 0
+
+    same_type = df[df["Tipo de carga"] == tipo_carga].copy()
+    base_ref = same_type if not same_type.empty else df
+
+    total_duration = base_ref["Duração min"].sum()
+    total_boxes = base_ref["Total caixas"].sum()
+
+    if total_duration <= 0 or total_boxes <= 0:
+        return 0
+
+    media_caixas_min = total_boxes / total_duration
+    if media_caixas_min <= 0:
+        return 0
+
+    estimado = int(round(total_caixas / media_caixas_min))
+    if metragem_cubica and metragem_cubica > 0:
+        estimado += int(round(metragem_cubica * 1.5))
+
+    return max(estimado, 1)
 
 
 # =========================================================
@@ -577,6 +852,7 @@ def build_management_df():
 def page_assistente():
     show_logo_main()
     st.title("Assistente de Logística")
+    st.caption("Carga de bases, manutenção e reabertura de conferências divergentes")
 
     col1, col2 = st.columns(2)
 
@@ -631,7 +907,7 @@ def page_assistente():
         a.metric("Linhas válidas", len(base))
         b.metric("DTs", base["dt"].nunique())
         c.metric("Remessas", base["remessa"].nunique())
-        st.dataframe(base.head(50), use_container_width=True)
+        st.dataframe(base.head(50), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Refazer conferência de DT divergente")
@@ -685,22 +961,45 @@ def page_conferencia():
     tipo_carga = meta.get("tipo_carga", "")
     metragem_cubica = float(items_df["metragem_cubica"].fillna(0).sum()) if "metragem_cubica" in items_df.columns else 0
 
-    top1, top2, top3, top4 = st.columns(4)
-    top1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
-    top2.info(f"**Transportadora**\n\n{meta.get('transportadora', '')}")
-    top3.info(f"**Status DT**\n\n{meta.get('status_dt', 'PENDENTE')}")
-    top4.info(f"**Remessas na DT**\n\n{meta.get('qtd_remessas', 0)}")
+    mgmt_hist = build_management_df()
+    tempo_estimado = estimate_minutes_by_history(
+        mgmt_hist,
+        total_caixas=total_caixas,
+        metragem_cubica=metragem_cubica,
+        tipo_carga=tipo_carga,
+    )
 
-    top5, top6, top7, top8 = st.columns(4)
-    top5.info(f"**SKU únicos**\n\n{qtd_skus_unicos}")
-    top6.info(f"**Total de caixas**\n\n{total_caixas}")
-    top7.info(f"**Data agenda**\n\n{data_agenda}")
-    top8.info(f"**Hora agenda**\n\n{hora_agenda}")
+    row1 = st.columns(4)
+    with row1[0]:
+        info_card("Cliente", meta.get("cliente", ""))
+    with row1[1]:
+        info_card("Transportadora", meta.get("transportadora", ""))
+    with row1[2]:
+        info_card("Status DT", meta.get("status_dt", "PENDENTE"))
+    with row1[3]:
+        info_card("Remessas na DT", meta.get("qtd_remessas", 0))
 
-    top9, top10, top11 = st.columns(3)
-    top9.info(f"**Perfil de carregamento**\n\n{perfil_carregamento}")
-    top10.info(f"**Tipo de carga**\n\n{tipo_carga}")
-    top11.info(f"**Metragem cúbica**\n\n{metragem_cubica:.3f} m³")
+    row2 = st.columns(4)
+    with row2[0]:
+        info_card("SKU únicos", qtd_skus_unicos)
+    with row2[1]:
+        info_card("Total de caixas", total_caixas)
+    with row2[2]:
+        info_card("Data agenda", data_agenda)
+    with row2[3]:
+        info_card("Hora agenda", hora_agenda)
+
+    row3 = st.columns(4)
+    with row3[0]:
+        info_card("Perfil de carregamento", perfil_carregamento)
+    with row3[1]:
+        info_card("Tipo de carga", tipo_carga)
+    with row3[2]:
+        info_card("Metragem cúbica", f"{metragem_cubica:.3f} m³")
+    with row3[3]:
+        info_card("Previsão de conferência", f"{tempo_estimado} min")
+
+    st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
     conferente = c1.text_input("Conferente", value=meta.get("conferente", ""), key=f"conf_{dt}")
@@ -802,6 +1101,8 @@ def page_conferencia():
 
     has_divergence = div_count > 0
 
+    st.divider()
+
     b1, b2, b3 = st.columns(3)
 
     if b1.button("Gerar PDF", key=f"pdf_{dt}"):
@@ -819,34 +1120,57 @@ def page_conferencia():
             key=f"download_pdf_{dt}",
         )
 
+    snapshot_atual = get_dt_snapshot(dt)
+    pdf_url = snapshot_atual["meta"].get("pdf_url", "")
+    if pdf_url:
+        st.link_button("Abrir PDF salvo online", pdf_url, use_container_width=True)
+
     if b2.button("Finalizar conferência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_ok_{dt}"):
         if has_divergence:
             st.error("Existem divergências. Use a opção de finalizar com divergência.")
         else:
             finalize_dt(dt, "FINALIZADO", conferente, turno)
-            pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
-            file_name = f"espelho_dt_{dt}.pdf"
+
+            snapshot_final = get_dt_snapshot(dt)
+            pdf_bytes = generate_pdf_bytes(snapshot_final)
+            file_name = f"espelho_dt_{dt}_{now_sp_file()}.pdf"
+
             st.session_state["last_pdf_bytes"] = pdf_bytes
             st.session_state["last_pdf_name"] = file_name
 
             try:
-                send_pdf_email(pdf_bytes, file_name, dt, "FINALIZADO")
-                st.success("Conferência finalizada e PDF enviado por e-mail.")
+                cloud_result = upload_pdf_to_cloudinary(pdf_bytes, file_name)
+                snapshot_final["meta"]["pdf_url"] = cloud_result["url"]
+                snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
+                save_dt_snapshot(dt, snapshot_final)
+
+                send_pdf_email(pdf_bytes, file_name, dt, "FINALIZADO", cloud_result["url"])
+                st.success("Conferência finalizada, PDF salvo online e enviado por e-mail.")
+                st.rerun()
             except Exception as e:
-                st.warning(f"Conferência finalizada, mas houve erro no envio do e-mail: {e}")
+                st.warning(f"Conferência finalizada, mas houve erro ao salvar/enviar PDF: {e}")
 
     if b3.button("Finalizar com divergência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_div_{dt}"):
         finalize_dt(dt, "DIVERGENTE", conferente, turno)
-        pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
-        file_name = f"espelho_dt_{dt}.pdf"
+
+        snapshot_final = get_dt_snapshot(dt)
+        pdf_bytes = generate_pdf_bytes(snapshot_final)
+        file_name = f"espelho_dt_{dt}_{now_sp_file()}.pdf"
+
         st.session_state["last_pdf_bytes"] = pdf_bytes
         st.session_state["last_pdf_name"] = file_name
 
         try:
-            send_pdf_email(pdf_bytes, file_name, dt, "DIVERGENTE")
-            st.warning("Conferência finalizada com divergência e PDF enviado por e-mail.")
+            cloud_result = upload_pdf_to_cloudinary(pdf_bytes, file_name)
+            snapshot_final["meta"]["pdf_url"] = cloud_result["url"]
+            snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
+            save_dt_snapshot(dt, snapshot_final)
+
+            send_pdf_email(pdf_bytes, file_name, dt, "DIVERGENTE", cloud_result["url"])
+            st.warning("Conferência finalizada com divergência, PDF salvo online e enviado por e-mail.")
+            st.rerun()
         except Exception as e:
-            st.warning(f"Conferência finalizada com divergência, mas houve erro no envio do e-mail: {e}")
+            st.warning(f"Conferência finalizada com divergência, mas houve erro ao salvar/enviar PDF: {e}")
 
 
 def page_gestao():
@@ -892,8 +1216,10 @@ def page_gestao():
     chart_col3, chart_col4 = st.columns(2)
 
     with chart_col3:
+        conf_df = mgmt.copy()
+        conf_df["Conferente"] = conf_df["Conferente"].replace("", "Sem conferente")
         fig_conf = px.bar(
-            mgmt.groupby("Conferente", dropna=False).size().reset_index(name="DTs"),
+            conf_df.groupby("Conferente", dropna=False).size().reset_index(name="DTs"),
             x="Conferente",
             y="DTs",
             title="DTs por Conferente"
@@ -908,6 +1234,22 @@ def page_gestao():
             title="Top 10 DTs por Total de Caixas"
         )
         st.plotly_chart(fig_caixas, use_container_width=True)
+
+    st.subheader("Ranking de Conferentes")
+    ranking = build_conferente_ranking(mgmt)
+
+    if not ranking.empty:
+        st.dataframe(
+            ranking[[
+                "Posição", "Conferente", "DTs", "DTs_Finalizadas",
+                "DTs_Divergentes", "Total_Caixas", "Tempo Total",
+                "Produtividade", "Total_Divergencias"
+            ]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Ainda não há dados suficientes para ranking.")
 
     st.subheader("Fila de DTs")
 
