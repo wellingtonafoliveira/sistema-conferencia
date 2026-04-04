@@ -7,7 +7,7 @@ from datetime import datetime
 import plotly.express as px
 
 # PDF
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import *
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -18,90 +18,31 @@ from io import BytesIO
 import cloudinary
 import cloudinary.uploader
 
-# CONFIG CLOUDINARY
+# CONFIG
+st.set_page_config(layout="wide")
+LOGO = "Nadir_Branco_Laranja.png"
+DATA_FILE = "data.json"
+VL06_FILE = "vl06.json"
+
+# CLOUDINARY
 cloudinary.config(
     cloud_name=st.secrets["cloudinary"]["cloud_name"],
     api_key=st.secrets["cloudinary"]["api_key"],
     api_secret=st.secrets["cloudinary"]["api_secret"]
 )
 
-# CONFIG APP
-st.set_page_config(layout="wide")
-LOGO = "Nadir_Branco_Laranja.png"
-DATA_FILE = "data.json"
-
 # ===== TIME =====
-def agora_br():
+def agora():
     return datetime.now(pytz.timezone("America/Sao_Paulo"))
 
-# ===== DATABASE =====
-def load():
-    if not os.path.exists(DATA_FILE):
+# ===== LOAD =====
+def load(file):
+    if not os.path.exists(file):
         return {}
-    return json.load(open(DATA_FILE))
+    return json.load(open(file))
 
-def save(data):
-    json.dump(data, open(DATA_FILE, "w"), indent=2)
-
-# ===== PDF =====
-def gerar_pdf(dt, info):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    try:
-        elements.append(Image(LOGO, width=4*cm, height=2*cm))
-    except:
-        pass
-
-    elements.append(Paragraph("<b>ESPELHO DE CONFERÊNCIA</b>", styles["Title"]))
-    elements.append(Spacer(1, 10))
-
-    texto = f"""
-    <b>DT:</b> {dt}<br/>
-    <b>Conferente:</b> {info['conferente']}<br/>
-    <b>Início:</b> {info['inicio']}<br/>
-    <b>Fim:</b> {info['fim']}<br/>
-    <b>Total Caixas:</b> {info['caixas']}
-    """
-
-    elements.append(Paragraph(texto, styles["Normal"]))
-    elements.append(Spacer(1, 20))
-
-    table_data = [["Campo", "Valor"]]
-    table_data.append(["DT", dt])
-    table_data.append(["Conferente", info["conferente"]])
-    table_data.append(["Caixas", info["caixas"]])
-
-    table = Table(table_data)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.white),
-        ('GRID',(0,0),(-1,-1),1,colors.black)
-    ]))
-
-    elements.append(table)
-    elements.append(Spacer(1, 30))
-
-    elements.append(Paragraph("__________________________", styles["Normal"]))
-    elements.append(Paragraph("Conferente", styles["Normal"]))
-
-    doc.build(elements)
-    pdf = buffer.getvalue()
-    buffer.close()
-
-    return pdf
-
-# ===== CLOUD =====
-def upload_pdf(pdf_bytes, nome):
-    result = cloudinary.uploader.upload(
-        pdf_bytes,
-        resource_type="raw",
-        public_id=nome,
-        format="pdf"
-    )
-    return result["secure_url"]
+def save(data, file):
+    json.dump(data, open(file, "w"), indent=2)
 
 # ===== LOGIN =====
 def login():
@@ -118,15 +59,72 @@ def login():
                 st.session_state["perfil"] = perfil
                 st.rerun()
 
-# ===== MAIN =====
+# ===== PDF =====
+def gerar_pdf(dt, dados):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Image(LOGO, width=4*cm, height=2*cm))
+    elements.append(Paragraph("<b>Espelho de Conferência</b>", styles["Title"]))
+    elements.append(Spacer(1,10))
+
+    info = f"""
+    DT: {dt}<br/>
+    Conferente: {dados['conferente']}<br/>
+    Início: {dados['inicio']}<br/>
+    Fim: {dados['fim']}<br/>
+    Caixas: {dados['caixas']}
+    """
+
+    elements.append(Paragraph(info, styles["Normal"]))
+    elements.append(Spacer(1,20))
+
+    doc.build(elements)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+# ===== UPLOAD =====
+def upload_pdf(pdf, nome):
+    result = cloudinary.uploader.upload(
+        pdf,
+        resource_type="raw",
+        public_id=nome,
+        format="pdf"
+    )
+    return result["secure_url"]
+
+# ===== LOGIN =====
 if "user" not in st.session_state:
     login()
     st.stop()
 
-data = load()
+perfil = st.session_state["perfil"]
 
 st.sidebar.image(LOGO)
-menu = st.sidebar.selectbox("Menu", ["Conferência","Gestão"])
+menu = st.sidebar.selectbox("Menu", ["Assistente","Conferência","Gestão"])
+
+data = load(DATA_FILE)
+vl06 = load(VL06_FILE)
+
+# ===== ASSISTENTE =====
+if menu == "Assistente" and perfil != "conferente":
+
+    st.title("Upload VL06")
+
+    file = st.file_uploader("Enviar VL06")
+
+    if file:
+        df = pd.read_excel(file)
+
+        df = df[df["Qtd.remessa"] > 0]
+
+        vl06 = df.to_dict(orient="records")
+        save(vl06, VL06_FILE)
+
+        st.success("VL06 carregada com sucesso")
 
 # ===== CONFERÊNCIA =====
 if menu == "Conferência":
@@ -135,38 +133,36 @@ if menu == "Conferência":
 
     dt = st.text_input("Digite a DT")
 
-    if st.button("Iniciar"):
-        data[dt] = {
-            "inicio": agora_br().strftime("%d/%m/%Y %H:%M:%S"),
-            "fim": "",
-            "conferente": st.session_state["user"],
-            "caixas": 0,
-            "pdf": ""
-        }
-        save(data)
+    if dt not in data:
+        if st.button("Iniciar"):
+            data[dt] = {
+                "inicio": agora().strftime("%d/%m/%Y %H:%M"),
+                "fim": "",
+                "conferente": st.session_state["user"],
+                "caixas": 0,
+                "pdf": ""
+            }
+            save(data, DATA_FILE)
 
     if dt in data:
-        info = data[dt]
+        st.write(data[dt])
 
-        st.write(info)
-
-        caixas = st.number_input("Adicionar caixas", 0)
+        qtd = st.number_input("Adicionar caixas", 0)
 
         if st.button("Adicionar"):
-            data[dt]["caixas"] += caixas
-            save(data)
+            data[dt]["caixas"] += qtd
+            save(data, DATA_FILE)
 
         if st.button("Finalizar"):
-            data[dt]["fim"] = agora_br().strftime("%d/%m/%Y %H:%M:%S")
+            data[dt]["fim"] = agora().strftime("%d/%m/%Y %H:%M")
 
             pdf = gerar_pdf(dt, data[dt])
             url = upload_pdf(pdf, f"DT_{dt}")
 
             data[dt]["pdf"] = url
+            save(data, DATA_FILE)
 
-            save(data)
-
-            st.success("PDF salvo na nuvem!")
+            st.success("PDF salvo")
             st.link_button("Abrir PDF", url)
 
 # ===== GESTÃO =====
@@ -185,6 +181,7 @@ if menu == "Gestão":
         st.plotly_chart(fig)
 
         st.subheader("PDFs")
-        for i, row in df.iterrows():
+
+        for _, row in df.iterrows():
             if row["pdf"]:
                 st.link_button(f"DT {row['dt']}", row["pdf"])
