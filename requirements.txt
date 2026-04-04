@@ -1,10 +1,9 @@
 streamlit
 pandas
-openpyxl
-reportlab
+plotly
 resend
 filelock
-plotly
-Cloudinary
 reportlab
-pytz
+cloudinary
+openpyxl
+xlrd
