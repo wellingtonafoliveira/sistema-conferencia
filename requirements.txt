@@ -1,7 +1,6 @@
 streamlit
 pandas
 plotly
-resend
 filelock
 reportlab
 cloudinary
