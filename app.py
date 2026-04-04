@@ -35,6 +35,10 @@ REQUIRED_VL06_COLUMNS = [
     "Peso total",
     "Peso líquido",
     "Volume",
+    "Data agenda",
+    "Hora agenda",
+    "Perfil de carregamento",
+    "Total de caixas",
 ]
 
 resend.api_key = st.secrets["resend"]["api_key"]
@@ -65,19 +69,6 @@ def save_store(data):
     with FileLock(LOCK_FILE):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def reset_runtime_cache():
-    keys = [
-        "base_vl06_df",
-        "sku_base_df",
-        "conferencias_cache",
-        "last_pdf_bytes",
-        "last_pdf_name",
-    ]
-    for k in keys:
-        if k in st.session_state:
-            del st.session_state[k]
 
 
 # =========================================================
@@ -163,6 +154,23 @@ def to_int_qty(value):
         return 0
 
 
+def to_float_qty(value):
+    if pd.isna(value):
+        return 0.0
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    text = text.replace(" ", "")
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
 def compute_item_status(qtd_conferida, qtd_solicitada):
     if int(qtd_conferida) == 0:
         return "PENDENTE"
@@ -202,19 +210,28 @@ def normalize_vl06(df_raw):
         "descricao": df["Denominação de item"].apply(clean_str),
         "qtd_solicitada": df["Qtd.remessa"].apply(to_int_qty),
         "cliente": df["Nome do emissor da ordem"].apply(clean_str),
-        "peso_total": df["Peso total"].apply(to_int_qty),
-        "peso_liquido": df["Peso líquido"].apply(to_int_qty),
-        "volume": df["Volume"].apply(to_int_qty),
+        "peso_total": df["Peso total"].apply(to_float_qty),
+        "peso_liquido": df["Peso líquido"].apply(to_float_qty),
+        "volume": df["Volume"].apply(to_float_qty),
+
+        # Novos campos
+        "data_agenda": df["Data agenda"].apply(clean_str),
+        "hora_agenda": df["Hora agenda"].apply(clean_str),
+        "perfil_carregamento": df["Perfil de carregamento"].apply(clean_str),
+        "total_caixas": df["Total de caixas"].apply(to_int_qty),
+
+        # Cálculo de metragem cúbica
+        "metragem_cubica": df["Volume"].apply(to_float_qty) / 1000.0,
     })
 
-    # ignora linhas com qtd.remessa 0
+    # Ignora linhas sem DT, sem material e com quantidade 0
     out = out[
         (out["dt"] != "") &
         (out["material"] != "") &
         (out["qtd_solicitada"] > 0)
     ].copy()
 
-    # mantém várias remessas dentro da mesma DT
+    # Mantém várias remessas dentro da mesma DT
     out = out.drop_duplicates(
         subset=["dt", "remessa", "doc_referencia", "material", "descricao", "qtd_solicitada"]
     ).reset_index(drop=True)
@@ -318,6 +335,11 @@ def get_dt_snapshot(dt):
             "cliente": clean_str(df_dt["cliente"].iloc[0]),
             "transportadora": clean_str(df_dt["transportadora"].iloc[0]),
             "qtd_remessas": int(df_dt["remessa"].nunique()),
+            "data_agenda": clean_str(df_dt["data_agenda"].iloc[0]),
+            "hora_agenda": clean_str(df_dt["hora_agenda"].iloc[0]),
+            "perfil_carregamento": clean_str(df_dt["perfil_carregamento"].iloc[0]),
+            "total_caixas": int(df_dt["total_caixas"].fillna(0).max()),
+            "metragem_cubica": float(df_dt["metragem_cubica"].fillna(0).sum()),
         },
         "items": apply_statuses(df_dt).to_dict(orient="records"),
     }
@@ -409,7 +431,12 @@ def generate_pdf_bytes(snapshot):
     story.append(Paragraph(f"Turno: {meta.get('turno', '')}", styles["Normal"]))
     story.append(Paragraph(f"Início: {meta.get('inicio', '')}", styles["Normal"]))
     story.append(Paragraph(f"Fim: {meta.get('fim', '')}", styles["Normal"]))
-    story.append(Paragraph(f"Quantidade de remessas: {int(items_df['remessa'].nunique())}", styles["Normal"]))
+    story.append(Paragraph(f"Data agenda: {meta.get('data_agenda', '')}", styles["Normal"]))
+    story.append(Paragraph(f"Hora agenda: {meta.get('hora_agenda', '')}", styles["Normal"]))
+    story.append(Paragraph(f"Perfil de carregamento: {meta.get('perfil_carregamento', '')}", styles["Normal"]))
+    story.append(Paragraph(f"Quantidade de remessas: {meta.get('qtd_remessas', 0)}", styles["Normal"]))
+    story.append(Paragraph(f"Total de caixas: {meta.get('total_caixas', 0)}", styles["Normal"]))
+    story.append(Paragraph(f"Metragem cúbica: {meta.get('metragem_cubica', 0):.3f} m³", styles["Normal"]))
     story.append(Spacer(1, 10))
 
     table_data = [[
@@ -457,8 +484,8 @@ def send_pdf_email(pdf_bytes, filename, dt, status_dt):
         """,
         "attachments": [
             {
-                "content": attachment_b64,
                 "filename": filename,
+                "content": attachment_b64,
             }
         ],
     }
@@ -491,6 +518,7 @@ def build_management_df():
             "Fim": meta.get("fim", ""),
             "Status DT": meta.get("status_dt", "PENDENTE"),
             "Itens": len(items_df),
+            "SKU únicos": items_df["material"].astype(str).nunique() if not items_df.empty else 0,
             "OK": int((items_df["status_item"] == "OK").sum()) if not items_df.empty else 0,
             "Divergentes": int((items_df["status_item"] == "DIVERGENTE").sum()) if not items_df.empty else 0,
             "Pendentes": int((items_df["status_item"] == "PENDENTE").sum()) if not items_df.empty else 0,
@@ -500,7 +528,7 @@ def build_management_df():
 
 
 # =========================================================
-# UI
+# PÁGINAS
 # =========================================================
 def page_assistente():
     st.title("Assistente de Logística")
@@ -580,11 +608,31 @@ def page_conferencia():
     snapshot = get_dt_snapshot(dt)
     meta = snapshot["meta"]
 
-    t1, t2, t3, t4 = st.columns(4)
-    t1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
-    t2.info(f"**Transportadora**\n\n{meta.get('transportadora', '')}")
-    t3.info(f"**Status DT**\n\n{meta.get('status_dt', 'PENDENTE')}")
-    t4.info(f"**Remessas na DT**\n\n{meta.get('qtd_remessas', 0)}")
+    items_df = snapshot_to_df(snapshot)
+    items_df = apply_statuses(items_df).sort_values(by=["remessa", "material"]).reset_index(drop=True)
+
+    qtd_skus_unicos = items_df["material"].astype(str).nunique()
+    total_caixas = meta.get("total_caixas", 0)
+    data_agenda = meta.get("data_agenda", "")
+    hora_agenda = meta.get("hora_agenda", "")
+    perfil_carregamento = meta.get("perfil_carregamento", "")
+    metragem_cubica = float(meta.get("metragem_cubica", 0))
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
+    top2.info(f"**Transportadora**\n\n{meta.get('transportadora', '')}")
+    top3.info(f"**Status DT**\n\n{meta.get('status_dt', 'PENDENTE')}")
+    top4.info(f"**Remessas na DT**\n\n{meta.get('qtd_remessas', 0)}")
+
+    top5, top6, top7, top8 = st.columns(4)
+    top5.info(f"**SKU únicos**\n\n{qtd_skus_unicos}")
+    top6.info(f"**Total de caixas**\n\n{total_caixas}")
+    top7.info(f"**Data agenda**\n\n{data_agenda}")
+    top8.info(f"**Hora agenda**\n\n{hora_agenda}")
+
+    top9, top10 = st.columns(2)
+    top9.info(f"**Perfil de carregamento**\n\n{perfil_carregamento}")
+    top10.info(f"**Metragem cúbica**\n\n{metragem_cubica:.3f} m³")
 
     c1, c2, c3, c4 = st.columns(4)
     conferente = c1.text_input("Conferente", value=meta.get("conferente", ""), key=f"conf_{dt}")
@@ -607,9 +655,6 @@ def page_conferencia():
         st.warning("Esta DT foi finalizada com divergência e pode ser reaberta pela Gestão.")
     else:
         mark_dt_started(dt, conferente, turno)
-
-    items_df = snapshot_to_df(get_dt_snapshot(dt))
-    items_df = apply_statuses(items_df).sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
     sku_df = get_sku_df()
     sku_map = dict(zip(sku_df["sku"].astype(str), sku_df["qtd_palete"].astype(int))) if not sku_df.empty else {}
