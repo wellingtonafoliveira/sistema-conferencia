@@ -38,7 +38,6 @@ REQUIRED_VL06_COLUMNS = [
     "Data agenda",
     "Hora agenda",
     "Perfil de carregamento",
-    "Total de caixas",
 ]
 
 resend.api_key = st.secrets["resend"]["api_key"]
@@ -213,25 +212,20 @@ def normalize_vl06(df_raw):
         "peso_total": df["Peso total"].apply(to_float_qty),
         "peso_liquido": df["Peso líquido"].apply(to_float_qty),
         "volume": df["Volume"].apply(to_float_qty),
-
-        # Novos campos
         "data_agenda": df["Data agenda"].apply(clean_str),
         "hora_agenda": df["Hora agenda"].apply(clean_str),
         "perfil_carregamento": df["Perfil de carregamento"].apply(clean_str),
-        "total_caixas": df["Total de caixas"].apply(to_int_qty),
-
-        # Cálculo de metragem cúbica
         "metragem_cubica": df["Volume"].apply(to_float_qty) / 1000.0,
     })
 
-    # Ignora linhas sem DT, sem material e com quantidade 0
+    # ignora linhas com qtd.remessa = 0
     out = out[
         (out["dt"] != "") &
         (out["material"] != "") &
         (out["qtd_solicitada"] > 0)
     ].copy()
 
-    # Mantém várias remessas dentro da mesma DT
+    # permite múltiplas remessas na mesma DT
     out = out.drop_duplicates(
         subset=["dt", "remessa", "doc_referencia", "material", "descricao", "qtd_solicitada"]
     ).reset_index(drop=True)
@@ -338,7 +332,7 @@ def get_dt_snapshot(dt):
             "data_agenda": clean_str(df_dt["data_agenda"].iloc[0]),
             "hora_agenda": clean_str(df_dt["hora_agenda"].iloc[0]),
             "perfil_carregamento": clean_str(df_dt["perfil_carregamento"].iloc[0]),
-            "total_caixas": int(df_dt["total_caixas"].fillna(0).max()),
+            "total_caixas": int(df_dt["qtd_solicitada"].fillna(0).sum()),
             "metragem_cubica": float(df_dt["metragem_cubica"].fillna(0).sum()),
         },
         "items": apply_statuses(df_dt).to_dict(orient="records"),
@@ -519,6 +513,8 @@ def build_management_df():
             "Status DT": meta.get("status_dt", "PENDENTE"),
             "Itens": len(items_df),
             "SKU únicos": items_df["material"].astype(str).nunique() if not items_df.empty else 0,
+            "Total caixas": int(items_df["qtd_solicitada"].fillna(0).sum()) if not items_df.empty else 0,
+            "M³": round(float(items_df["metragem_cubica"].fillna(0).sum()), 3) if "metragem_cubica" in items_df.columns else 0,
             "OK": int((items_df["status_item"] == "OK").sum()) if not items_df.empty else 0,
             "Divergentes": int((items_df["status_item"] == "DIVERGENTE").sum()) if not items_df.empty else 0,
             "Pendentes": int((items_df["status_item"] == "PENDENTE").sum()) if not items_df.empty else 0,
@@ -612,11 +608,11 @@ def page_conferencia():
     items_df = apply_statuses(items_df).sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
     qtd_skus_unicos = items_df["material"].astype(str).nunique()
-    total_caixas = meta.get("total_caixas", 0)
+    total_caixas = int(items_df["qtd_solicitada"].fillna(0).sum())
     data_agenda = meta.get("data_agenda", "")
     hora_agenda = meta.get("hora_agenda", "")
     perfil_carregamento = meta.get("perfil_carregamento", "")
-    metragem_cubica = float(meta.get("metragem_cubica", 0))
+    metragem_cubica = float(items_df["metragem_cubica"].fillna(0).sum()) if "metragem_cubica" in items_df.columns else 0
 
     top1, top2, top3, top4 = st.columns(4)
     top1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
