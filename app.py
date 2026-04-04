@@ -8,7 +8,6 @@ from io import BytesIO
 from zoneinfo import ZoneInfo
 
 import cloudinary
-import cloudinary.api
 import cloudinary.uploader
 import pandas as pd
 import plotly.express as px
@@ -20,8 +19,14 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 # =========================================================
 # CONFIG
@@ -30,7 +35,7 @@ st.set_page_config(page_title="Sistema de Conferência", layout="wide")
 
 DATA_FILE = "data_store.json"
 LOCK_FILE = "data_store.lock"
-LOGO_FILE = "Nadir_Branco_Laranja.png"
+LOGO_FILE = "Nadir.png"
 APP_TZ = ZoneInfo("America/Sao_Paulo")
 
 REQUIRED_VL06_COLUMNS = [
@@ -66,7 +71,7 @@ cloudinary.config(
 # =========================================================
 # HELPERS UI
 # =========================================================
-def show_logo_main(width=220):
+def show_logo_main(width=260):
     if os.path.exists(LOGO_FILE):
         st.image(LOGO_FILE, width=width)
 
@@ -80,17 +85,17 @@ def info_card(label, value):
     st.markdown(
         f"""
         <div style="
-            background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
-            border: 1px solid #fed7aa;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #dbeafe;
             border-radius: 14px;
             padding: 14px 16px;
             min-height: 95px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.04);
         ">
-            <div style="font-size: 12px; color: #9a3412; font-weight: 600; margin-bottom: 6px;">
+            <div style="font-size: 12px; color: #1d4ed8; font-weight: 600; margin-bottom: 6px;">
                 {label}
             </div>
-            <div style="font-size: 18px; color: #431407; font-weight: 700;">
+            <div style="font-size: 18px; color: #0f172a; font-weight: 700;">
                 {value if value not in [None, ''] else '-'}
             </div>
         </div>
@@ -171,7 +176,7 @@ def login_screen():
     col_logo, col_title = st.columns([1, 3])
 
     with col_logo:
-        show_logo_main(width=180)
+        show_logo_main(width=190)
 
     with col_title:
         st.title("Acesso ao Sistema")
@@ -439,6 +444,10 @@ def get_dt_snapshot(dt):
             snapshot["meta"]["pdf_url"] = ""
         if "pdf_public_id" not in snapshot["meta"]:
             snapshot["meta"]["pdf_public_id"] = ""
+        if "assinatura_conferente" not in snapshot["meta"]:
+            snapshot["meta"]["assinatura_conferente"] = ""
+        if "assinatura_lider" not in snapshot["meta"]:
+            snapshot["meta"]["assinatura_lider"] = ""
         return snapshot
 
     base = get_base_vl06_df()
@@ -465,6 +474,8 @@ def get_dt_snapshot(dt):
             "metragem_cubica": float(df_dt["metragem_cubica"].fillna(0).sum()),
             "pdf_url": "",
             "pdf_public_id": "",
+            "assinatura_conferente": "",
+            "assinatura_lider": "",
         },
         "items": apply_statuses(df_dt).to_dict(orient="records"),
     }
@@ -514,12 +525,16 @@ def mark_dt_started(dt, conferente, turno):
     save_dt_snapshot(dt, snapshot)
 
 
-def finalize_dt(dt, final_status, conferente, turno):
+def finalize_dt(dt, final_status, conferente, turno, assinatura_conferente="", assinatura_lider=""):
     snapshot = deepcopy(get_dt_snapshot(dt))
     snapshot["meta"]["conferente"] = conferente
     snapshot["meta"]["turno"] = turno
+    snapshot["meta"]["assinatura_conferente"] = assinatura_conferente
+    snapshot["meta"]["assinatura_lider"] = assinatura_lider
+
     if not snapshot["meta"].get("inicio"):
         snapshot["meta"]["inicio"] = now_sp_str()
+
     snapshot["meta"]["fim"] = now_sp_str()
     snapshot["meta"]["status_dt"] = final_status
     save_dt_snapshot(dt, snapshot)
@@ -580,7 +595,7 @@ def generate_pdf_bytes(snapshot):
         pagesize=landscape(A4),
         leftMargin=12 * mm,
         rightMargin=12 * mm,
-        topMargin=10 * mm,
+        topMargin=12 * mm,
         bottomMargin=10 * mm,
     )
 
@@ -591,8 +606,8 @@ def generate_pdf_bytes(snapshot):
         alignment=TA_CENTER,
         fontSize=18,
         leading=22,
-        textColor=colors.HexColor("#9A3412"),
-        spaceAfter=6,
+        textColor=colors.HexColor("#1D39C4"),
+        spaceAfter=4,
     )
     subtitle_style = ParagraphStyle(
         "PdfSubtitle",
@@ -609,15 +624,28 @@ def generate_pdf_bytes(snapshot):
         fontSize=9,
         leading=11,
     )
+    signature_title_style = ParagraphStyle(
+        "SignatureTitle",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        fontSize=10,
+        leading=12,
+        textColor=colors.HexColor("#0F172A"),
+    )
 
     story = []
     meta = snapshot["meta"]
     items_df = snapshot_to_df(snapshot).copy().sort_values(by=["remessa", "material"]).reset_index(drop=True)
 
     if os.path.exists(LOGO_FILE):
-        w, h = get_image_dimensions(LOGO_FILE, width=42 * mm)
-        story.append(Image(LOGO_FILE, width=w, height=h))
-        story.append(Spacer(1, 2))
+        try:
+            w, h = get_image_dimensions(LOGO_FILE, width=62 * mm)
+            logo = Image(LOGO_FILE, width=w, height=h)
+            logo.hAlign = "LEFT"
+            story.append(logo)
+            story.append(Spacer(1, 4))
+        except Exception:
+            pass
 
     story.append(Paragraph("ESPELHO DE CONFERÊNCIA", title_style))
     story.append(Paragraph("Documento operacional de conferência logística", subtitle_style))
@@ -638,8 +666,8 @@ def generate_pdf_bytes(snapshot):
     info_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#D1D5DB")),
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FFF7ED")),
-        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#FFF7ED")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EFF4FF")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EFF4FF")),
         ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
         ("FONTSIZE", (0, 0), (-1, -1), 8),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -674,7 +702,7 @@ def generate_pdf_bytes(snapshot):
     )
 
     style_commands = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EA580C")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1D39C4")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9CA3AF")),
         ("FONTSIZE", (0, 0), (-1, -1), 7),
@@ -699,6 +727,33 @@ def generate_pdf_bytes(snapshot):
 
     table.setStyle(TableStyle(style_commands))
     story.append(table)
+    story.append(Spacer(1, 14))
+
+    assinatura_conferente = meta.get("assinatura_conferente", "") or meta.get("conferente", "")
+    assinatura_lider = meta.get("assinatura_lider", "")
+
+    signature_table = Table([
+        [
+            "",
+            "",
+        ],
+        [
+            f"________________________________________<br/>{assinatura_conferente}<br/>Assinatura do Conferente",
+            f"________________________________________<br/>{assinatura_lider}<br/>Assinatura da Liderança / Responsável",
+        ],
+    ], colWidths=[125 * mm, 125 * mm])
+
+    signature_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("FONTSIZE", (0, 1), (-1, 1), 9),
+    ]))
+
+    story.append(Paragraph("Assinaturas", signature_title_style))
+    story.append(Spacer(1, 6))
+    story.append(signature_table)
     story.append(Spacer(1, 8))
     story.append(Paragraph(f"Emitido em: {now_sp_str()}", normal_style))
 
@@ -1012,8 +1067,22 @@ def page_conferencia():
     c3.text_input("Início", value=meta.get("inicio", ""), disabled=True, key=f"inicio_{dt}")
     c4.text_input("Fim", value=meta.get("fim", ""), disabled=True, key=f"fim_{dt}")
 
+    s1, s2 = st.columns(2)
+    assinatura_conferente = s1.text_input(
+        "Nome para assinatura do conferente",
+        value=meta.get("assinatura_conferente", meta.get("conferente", "")),
+        key=f"assinatura_conf_{dt}",
+    )
+    assinatura_lider = s2.text_input(
+        "Nome para assinatura da liderança / responsável",
+        value=meta.get("assinatura_lider", ""),
+        key=f"assinatura_lider_{dt}",
+    )
+
     snapshot["meta"]["conferente"] = conferente
     snapshot["meta"]["turno"] = turno
+    snapshot["meta"]["assinatura_conferente"] = assinatura_conferente
+    snapshot["meta"]["assinatura_lider"] = assinatura_lider
     save_dt_snapshot(dt, snapshot)
 
     if dt_locked(snapshot):
@@ -1106,7 +1175,10 @@ def page_conferencia():
     b1, b2, b3 = st.columns(3)
 
     if b1.button("Gerar PDF", key=f"pdf_{dt}"):
-        pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
+        snapshot_preview = get_dt_snapshot(dt)
+        snapshot_preview["meta"]["assinatura_conferente"] = assinatura_conferente
+        snapshot_preview["meta"]["assinatura_lider"] = assinatura_lider
+        pdf_bytes = generate_pdf_bytes(snapshot_preview)
         st.session_state["last_pdf_bytes"] = pdf_bytes
         st.session_state["last_pdf_name"] = f"espelho_dt_{dt}.pdf"
         st.success("PDF gerado.")
@@ -1129,7 +1201,14 @@ def page_conferencia():
         if has_divergence:
             st.error("Existem divergências. Use a opção de finalizar com divergência.")
         else:
-            finalize_dt(dt, "FINALIZADO", conferente, turno)
+            finalize_dt(
+                dt,
+                "FINALIZADO",
+                conferente,
+                turno,
+                assinatura_conferente=assinatura_conferente,
+                assinatura_lider=assinatura_lider,
+            )
 
             snapshot_final = get_dt_snapshot(dt)
             pdf_bytes = generate_pdf_bytes(snapshot_final)
@@ -1151,7 +1230,14 @@ def page_conferencia():
                 st.warning(f"Conferência finalizada, mas houve erro ao salvar/enviar PDF: {e}")
 
     if b3.button("Finalizar com divergência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_div_{dt}"):
-        finalize_dt(dt, "DIVERGENTE", conferente, turno)
+        finalize_dt(
+            dt,
+            "DIVERGENTE",
+            conferente,
+            turno,
+            assinatura_conferente=assinatura_conferente,
+            assinatura_lider=assinatura_lider,
+        )
 
         snapshot_final = get_dt_snapshot(dt)
         pdf_bytes = generate_pdf_bytes(snapshot_final)
