@@ -6,6 +6,7 @@ from datetime import datetime
 from io import BytesIO
 
 import pandas as pd
+import plotly.express as px
 import resend
 import streamlit as st
 from filelock import FileLock
@@ -38,6 +39,7 @@ REQUIRED_VL06_COLUMNS = [
     "Data agenda",
     "Hora agenda",
     "Perfil de carregamento",
+    "Tipo de carga",
 ]
 
 resend.api_key = st.secrets["resend"]["api_key"]
@@ -170,6 +172,27 @@ def to_float_qty(value):
         return 0.0
 
 
+def format_date_only(value):
+    if pd.isna(value):
+        return ""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return clean_str(value)
+    return dt.strftime("%d/%m/%Y")
+
+
+def format_time_only(value):
+    if pd.isna(value):
+        return ""
+    text = clean_str(value)
+    if not text:
+        return ""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.notna(dt):
+        return dt.strftime("%H:%M")
+    return text
+
+
 def compute_item_status(qtd_conferida, qtd_solicitada):
     if int(qtd_conferida) == 0:
         return "PENDENTE"
@@ -212,20 +235,19 @@ def normalize_vl06(df_raw):
         "peso_total": df["Peso total"].apply(to_float_qty),
         "peso_liquido": df["Peso líquido"].apply(to_float_qty),
         "volume": df["Volume"].apply(to_float_qty),
-        "data_agenda": df["Data agenda"].apply(clean_str),
-        "hora_agenda": df["Hora agenda"].apply(clean_str),
+        "data_agenda": df["Data agenda"].apply(format_date_only),
+        "hora_agenda": df["Hora agenda"].apply(format_time_only),
         "perfil_carregamento": df["Perfil de carregamento"].apply(clean_str),
+        "tipo_carga": df["Tipo de carga"].apply(clean_str),
         "metragem_cubica": df["Volume"].apply(to_float_qty) / 1000.0,
     })
 
-    # ignora linhas com qtd.remessa = 0
     out = out[
         (out["dt"] != "") &
         (out["material"] != "") &
         (out["qtd_solicitada"] > 0)
     ].copy()
 
-    # permite múltiplas remessas na mesma DT
     out = out.drop_duplicates(
         subset=["dt", "remessa", "doc_referencia", "material", "descricao", "qtd_solicitada"]
     ).reset_index(drop=True)
@@ -332,6 +354,7 @@ def get_dt_snapshot(dt):
             "data_agenda": clean_str(df_dt["data_agenda"].iloc[0]),
             "hora_agenda": clean_str(df_dt["hora_agenda"].iloc[0]),
             "perfil_carregamento": clean_str(df_dt["perfil_carregamento"].iloc[0]),
+            "tipo_carga": clean_str(df_dt["tipo_carga"].iloc[0]),
             "total_caixas": int(df_dt["qtd_solicitada"].fillna(0).sum()),
             "metragem_cubica": float(df_dt["metragem_cubica"].fillna(0).sum()),
         },
@@ -428,6 +451,7 @@ def generate_pdf_bytes(snapshot):
     story.append(Paragraph(f"Data agenda: {meta.get('data_agenda', '')}", styles["Normal"]))
     story.append(Paragraph(f"Hora agenda: {meta.get('hora_agenda', '')}", styles["Normal"]))
     story.append(Paragraph(f"Perfil de carregamento: {meta.get('perfil_carregamento', '')}", styles["Normal"]))
+    story.append(Paragraph(f"Tipo de carga: {meta.get('tipo_carga', '')}", styles["Normal"]))
     story.append(Paragraph(f"Quantidade de remessas: {meta.get('qtd_remessas', 0)}", styles["Normal"]))
     story.append(Paragraph(f"Total de caixas: {meta.get('total_caixas', 0)}", styles["Normal"]))
     story.append(Paragraph(f"Metragem cúbica: {meta.get('metragem_cubica', 0):.3f} m³", styles["Normal"]))
@@ -505,6 +529,10 @@ def build_management_df():
             "DT": dt,
             "Cliente": meta.get("cliente", ""),
             "Transportadora": meta.get("transportadora", ""),
+            "Tipo de carga": meta.get("tipo_carga", ""),
+            "Perfil carregamento": meta.get("perfil_carregamento", ""),
+            "Data agenda": meta.get("data_agenda", ""),
+            "Hora agenda": meta.get("hora_agenda", ""),
             "Remessas": int(items_df["remessa"].nunique()) if not items_df.empty else 0,
             "Conferente": meta.get("conferente", ""),
             "Turno": meta.get("turno", ""),
@@ -575,6 +603,7 @@ def page_assistente():
                 st.error(f"Erro ao processar base SKU: {e}")
 
     st.divider()
+
     base = get_base_vl06_df()
     if not base.empty:
         a, b, c = st.columns(3)
@@ -582,6 +611,25 @@ def page_assistente():
         b.metric("DTs", base["dt"].nunique())
         c.metric("Remessas", base["remessa"].nunique())
         st.dataframe(base.head(50), use_container_width=True)
+
+    st.divider()
+    st.subheader("Refazer conferência de DT divergente")
+
+    mgmt = build_management_df()
+    if not mgmt.empty:
+        divergentes = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist()
+        if divergentes:
+            dt_refazer = st.selectbox("Selecione a DT divergente", divergentes, key="dt_refazer_assistente")
+            if st.button("Refazer conferência", key="btn_refazer_assistente"):
+                snapshot = get_dt_snapshot(dt_refazer)
+                if dt_can_reopen(snapshot):
+                    reopen_dt(dt_refazer)
+                    st.success(f"DT {dt_refazer} liberada para refazer conferência.")
+                    st.rerun()
+                else:
+                    st.error("Apenas DTs divergentes podem ser refeitas.")
+        else:
+            st.info("Não há DTs divergentes para refazer.")
 
 
 def page_conferencia():
@@ -612,6 +660,7 @@ def page_conferencia():
     data_agenda = meta.get("data_agenda", "")
     hora_agenda = meta.get("hora_agenda", "")
     perfil_carregamento = meta.get("perfil_carregamento", "")
+    tipo_carga = meta.get("tipo_carga", "")
     metragem_cubica = float(items_df["metragem_cubica"].fillna(0).sum()) if "metragem_cubica" in items_df.columns else 0
 
     top1, top2, top3, top4 = st.columns(4)
@@ -626,9 +675,10 @@ def page_conferencia():
     top7.info(f"**Data agenda**\n\n{data_agenda}")
     top8.info(f"**Hora agenda**\n\n{hora_agenda}")
 
-    top9, top10 = st.columns(2)
+    top9, top10, top11 = st.columns(3)
     top9.info(f"**Perfil de carregamento**\n\n{perfil_carregamento}")
-    top10.info(f"**Metragem cúbica**\n\n{metragem_cubica:.3f} m³")
+    top10.info(f"**Tipo de carga**\n\n{tipo_carga}")
+    top11.info(f"**Metragem cúbica**\n\n{metragem_cubica:.3f} m³")
 
     c1, c2, c3, c4 = st.columns(4)
     conferente = c1.text_input("Conferente", value=meta.get("conferente", ""), key=f"conf_{dt}")
@@ -648,7 +698,7 @@ def page_conferencia():
     if dt_locked(snapshot):
         st.error("Esta DT foi finalizada sem divergência e está bloqueada.")
     elif meta.get("status_dt") == "DIVERGENTE":
-        st.warning("Esta DT foi finalizada com divergência e pode ser reaberta pela Gestão.")
+        st.warning("Esta DT foi finalizada com divergência e pode ser reaberta pelo Assistente ou Gestão.")
     else:
         mark_dt_started(dt, conferente, turno)
 
@@ -790,12 +840,54 @@ def page_gestao():
         st.warning("Sem dados.")
         return
 
+    # KPIs
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total DTs", len(mgmt))
     c2.metric("Pendentes", int((mgmt["Status DT"] == "PENDENTE").sum()))
     c3.metric("Em andamento", int((mgmt["Status DT"] == "EM_ANDAMENTO").sum()))
     c4.metric("Finalizadas", int((mgmt["Status DT"] == "FINALIZADO").sum()))
     c5.metric("Divergentes", int((mgmt["Status DT"] == "DIVERGENTE").sum()))
+
+    st.subheader("Dashboard")
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        status_counts = mgmt["Status DT"].value_counts().reset_index()
+        status_counts.columns = ["Status", "Quantidade"]
+        fig_status = px.pie(status_counts, names="Status", values="Quantidade", title="Status das DTs")
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with chart_col2:
+        fig_tipo = px.bar(
+            mgmt.groupby("Tipo de carga", dropna=False).size().reset_index(name="Quantidade"),
+            x="Tipo de carga",
+            y="Quantidade",
+            title="DTs por Tipo de Carga"
+        )
+        st.plotly_chart(fig_tipo, use_container_width=True)
+
+    chart_col3, chart_col4 = st.columns(2)
+
+    with chart_col3:
+        fig_conf = px.bar(
+            mgmt.groupby("Conferente", dropna=False).size().reset_index(name="DTs"),
+            x="Conferente",
+            y="DTs",
+            title="DTs por Conferente"
+        )
+        st.plotly_chart(fig_conf, use_container_width=True)
+
+    with chart_col4:
+        fig_caixas = px.bar(
+            mgmt.sort_values("Total caixas", ascending=False).head(10),
+            x="DT",
+            y="Total caixas",
+            title="Top 10 DTs por Total de Caixas"
+        )
+        st.plotly_chart(fig_caixas, use_container_width=True)
+
+    st.subheader("Fila de DTs")
 
     filtro_status = st.selectbox("Filtrar por status", ["Todos", "PENDENTE", "EM_ANDAMENTO", "FINALIZADO", "DIVERGENTE"])
     show_df = mgmt.copy()
