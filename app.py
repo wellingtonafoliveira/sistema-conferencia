@@ -92,6 +92,35 @@ def info_card(label, value):
     )
 
 
+def dt_search_select(label, key_prefix="dt_search"):
+    dt_list = get_dt_list()
+    if not dt_list:
+        return ""
+
+    default_dt = get_selected_dt()
+    if default_dt and default_dt not in dt_list:
+        default_dt = ""
+
+    query_key = f"{key_prefix}_query"
+    select_key = f"{key_prefix}_select"
+
+    default_query = default_dt if default_dt else ""
+    query = st.text_input(label, value=default_query, key=query_key)
+
+    filtered = [d for d in dt_list if query.strip() in d] if query.strip() else dt_list
+
+    if not filtered:
+        st.warning("Nenhuma DT encontrada.")
+        return ""
+
+    index = 0
+    if default_dt in filtered:
+        index = filtered.index(default_dt)
+
+    dt = st.selectbox("DT encontrada", filtered, index=index, key=select_key)
+    return dt
+
+
 # =========================================================
 # TIME
 # =========================================================
@@ -590,6 +619,7 @@ def reset_dt_conferencia(dt):
 
     save_dt_snapshot(dt, snapshot)
     delete_insumos_by_dt(dt)
+    delete_boc_by_dt(dt)
 
 
 def reopen_dt(dt):
@@ -599,19 +629,19 @@ def reopen_dt(dt):
 
 
 # =========================================================
-# INSUMOS CP
+# DT SELECIONADA
 # =========================================================
 def get_selected_dt():
-    if "selected_dt" in st.session_state and st.session_state["selected_dt"]:
-        return st.session_state["selected_dt"]
-    dts = get_dt_list()
-    return dts[0] if dts else ""
+    return st.session_state.get("selected_dt", "")
 
 
 def set_selected_dt(dt):
     st.session_state["selected_dt"] = dt
 
 
+# =========================================================
+# INSUMOS CP
+# =========================================================
 def get_insumos_by_dt(dt):
     df = get_insumos_df()
     if df.empty:
@@ -644,6 +674,24 @@ def delete_insumos_by_dt(dt):
         return
     df = df[df["dt"].astype(str) != str(dt)].copy()
     save_insumos_df(df)
+
+
+# =========================================================
+# BOC
+# =========================================================
+def get_boc_by_dt(dt):
+    df = get_boc_df()
+    if df.empty:
+        return pd.DataFrame()
+    return df[df["dt"].astype(str) == str(dt)].copy()
+
+
+def delete_boc_by_dt(dt):
+    df = get_boc_df()
+    if df.empty:
+        return
+    df = df[df["dt"].astype(str) != str(dt)].copy()
+    save_boc_df(df)
 
 
 # =========================================================
@@ -725,6 +773,22 @@ def get_image_dimensions(path, width=None, height=None):
         aspect = iw / float(ih)
         width = height * aspect
     return width, height
+
+
+def _signature_cell(name, role):
+    styles = getSampleStyleSheet()
+    style = ParagraphStyle(
+        "SigCell",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#111827"),
+    )
+    name = clean_str(name)
+    role = clean_str(role)
+    text = f"Linha de assinatura<br/>{name}<br/>{role}"
+    return Paragraph(text, style)
 
 
 def generate_pdf_bytes(snapshot):
@@ -900,29 +964,64 @@ def generate_pdf_bytes(snapshot):
         else:
             story.append(Paragraph("Nenhum insumo CP registrado para esta DT.", normal_style))
 
+    boc_df = get_boc_by_dt(dt)
+    if not boc_df.empty:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Solicitações de BOC", section_style))
+        story.append(Spacer(1, 6))
+
+        boc_table_data = [["Data/Hora", "Remessa", "Item", "Descrição", "Qtd", "Usuário"]]
+        for _, row in boc_df.sort_values("data_hora", ascending=False).iterrows():
+            boc_table_data.append([
+                str(row.get("data_hora", "")),
+                str(row.get("remessa", "")),
+                str(row.get("item", "")),
+                str(row.get("descricao", "")),
+                str(row.get("qtd", "")),
+                str(row.get("usuario", "")),
+            ])
+
+        boc_table = Table(
+            boc_table_data,
+            repeatRows=1,
+            colWidths=[30 * mm, 25 * mm, 28 * mm, 95 * mm, 18 * mm, 30 * mm]
+        )
+        boc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1D39C4")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9CA3AF")),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(boc_table)
+
     story.append(Spacer(1, 14))
 
     assinatura_conferente = meta.get("assinatura_conferente", "") or meta.get("conferente", "")
     assinatura_lider = meta.get("assinatura_lider", "")
 
     signature_table = Table([
-        ["", ""],
         [
-            f"________________________________________<br/>{assinatura_conferente}<br/>Assinatura do Conferente",
-            f"________________________________________<br/>{assinatura_lider}<br/>Assinatura da Liderança / Responsável",
-        ],
+            _signature_cell(assinatura_conferente, "Assinatura do Conferente"),
+            _signature_cell(assinatura_lider, "Assinatura da Liderança / Responsável"),
+        ]
     ], colWidths=[125 * mm, 125 * mm])
 
     signature_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("LINEABOVE", (0, 0), (0, 0), 0.8, colors.HexColor("#6B7280")),
+        ("LINEABOVE", (1, 0), (1, 0), 0.8, colors.HexColor("#6B7280")),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("FONTSIZE", (0, 1), (-1, 1), 9),
     ]))
 
     story.append(Paragraph("Assinaturas", section_style))
-    story.append(Spacer(1, 6))
+    story.append(Spacer(1, 10))
     story.append(signature_table)
     story.append(Spacer(1, 8))
     story.append(Paragraph(f"Emitido em: {now_sp_str()}", normal_style))
@@ -976,6 +1075,7 @@ def build_management_df():
             "Pendentes": int((items_df["status_item"] == "PENDENTE").sum()) if not items_df.empty else 0,
             "PDF URL": meta.get("pdf_url", ""),
             "Insumos CP": "SIM" if has_insumos_cp(dt) and normalize_tipo_carga(meta.get("tipo_carga", "")) == "CP" else ("N/A" if normalize_tipo_carga(meta.get("tipo_carga", "")) != "CP" else "NÃO"),
+            "BOC": len(get_boc_by_dt(dt)),
         })
 
     df = pd.DataFrame(rows)
@@ -1116,15 +1216,21 @@ def page_assistente():
     if not mgmt.empty:
         divergentes = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist()
         if divergentes:
-            dt_refazer = st.selectbox("Selecione a DT divergente", divergentes, key="dt_refazer_assistente")
-            if st.button("Refazer conferência", key="btn_refazer_assistente"):
-                snapshot = get_dt_snapshot(dt_refazer)
-                if dt_can_reopen(snapshot):
-                    reopen_dt(dt_refazer)
-                    st.success(f"DT {dt_refazer} reaberta com conferência zerada. Pronta para iniciar do zero.")
-                    st.rerun()
-                else:
-                    st.error("Apenas DTs divergentes podem ser refeitas.")
+            query = st.text_input("Pesquisar DT divergente", key="assistente_div_query")
+            filtered = [d for d in divergentes if query.strip() in d] if query.strip() else divergentes
+
+            if filtered:
+                dt_refazer = st.selectbox("DT divergente encontrada", filtered, key="dt_refazer_assistente")
+                if st.button("Refazer conferência", key="btn_refazer_assistente"):
+                    snapshot = get_dt_snapshot(dt_refazer)
+                    if dt_can_reopen(snapshot):
+                        reopen_dt(dt_refazer)
+                        st.success(f"DT {dt_refazer} reaberta com conferência zerada. Pronta para iniciar do zero.")
+                        st.rerun()
+                    else:
+                        st.error("Apenas DTs divergentes podem ser refeitas.")
+            else:
+                st.info("Nenhuma DT divergente encontrada.")
         else:
             st.info("Não há DTs divergentes para refazer.")
 
@@ -1138,15 +1244,10 @@ def page_conferencia():
         st.info("Primeiro carregue a VL06 na área do Assistente.")
         return
 
-    dt_list = get_dt_list()
-    search = st.text_input("Pesquisar DT")
-    filtered = [d for d in dt_list if search.strip() in d] if search.strip() else dt_list
-
-    if not filtered:
-        st.warning("Nenhuma DT encontrada.")
+    dt = dt_search_select("Pesquisar DT", key_prefix="conferencia_dt")
+    if not dt:
         return
 
-    dt = st.selectbox("Selecione a DT", filtered)
     set_selected_dt(dt)
 
     snapshot = get_dt_snapshot(dt)
@@ -1189,7 +1290,7 @@ def page_conferencia():
     with row2[2]:
         info_card("Data agenda", data_agenda)
     with row2[3]:
-        info_card("Hora agenda", meta.get("hora_agenda", ""))
+        info_card("Hora agenda", hora_agenda)
 
     row3 = st.columns(4)
     with row3[0]:
@@ -1202,10 +1303,17 @@ def page_conferencia():
         info_card("Previsão de conferência", f"{tempo_estimado} min")
 
     if tipo_carga == "CP":
-        if has_insumos_cp(dt):
-            st.success("Insumos CP já lançados para esta DT.")
-        else:
-            st.warning("Esta DT é do tipo CP. O lançamento de insumos é obrigatório antes da finalização.")
+        cpa, cpb = st.columns([2, 1])
+        with cpa:
+            if has_insumos_cp(dt):
+                st.success("Insumos CP já lançados para esta DT.")
+            else:
+                st.warning("Esta DT é do tipo CP. O lançamento de insumos é obrigatório antes da finalização.")
+        with cpb:
+            if st.button("Ir para Insumos CP", use_container_width=True, key=f"goto_insumos_{dt}"):
+                st.session_state["selected_dt"] = dt
+                st.session_state["menu_target"] = "Insumos CP"
+                st.rerun()
 
     st.divider()
 
@@ -1325,6 +1433,15 @@ def page_conferencia():
     a2.metric("Itens divergentes", div_count)
     a3.metric("Itens pendentes", pen_count)
 
+    boc_df = get_boc_by_dt(dt)
+    if not boc_df.empty:
+        st.subheader("BOC registrados nesta DT")
+        st.dataframe(
+            boc_df.sort_values("data_hora", ascending=False),
+            use_container_width=True,
+            hide_index=True
+        )
+
     has_divergence = div_count > 0
     insumos_ok = has_insumos_cp(dt)
 
@@ -1430,10 +1547,10 @@ def page_insumos_cp():
         st.info("Primeiro carregue a VL06 na área do Assistente.")
         return
 
-    dt_list = get_dt_list()
-    dt_padrao = get_selected_dt()
-    idx_padrao = dt_list.index(dt_padrao) if dt_padrao in dt_list else 0
-    dt = st.selectbox("Selecione a DT", dt_list, index=idx_padrao, key="dt_insumos_cp")
+    dt = dt_search_select("Pesquisar DT", key_prefix="insumos_dt")
+    if not dt:
+        return
+
     set_selected_dt(dt)
 
     snapshot = get_dt_snapshot(dt)
@@ -1492,10 +1609,10 @@ def page_boc():
         st.info("Primeiro carregue a VL06 na área do Assistente.")
         return
 
-    dt_list = get_dt_list()
-    dt_padrao = get_selected_dt()
-    idx_padrao = dt_list.index(dt_padrao) if dt_padrao in dt_list else 0
-    dt = st.selectbox("Selecione a DT", dt_list, index=idx_padrao, key="dt_boc")
+    dt = dt_search_select("Pesquisar DT", key_prefix="boc_dt")
+    if not dt:
+        return
+
     set_selected_dt(dt)
 
     snapshot = get_dt_snapshot(dt)
@@ -1534,15 +1651,14 @@ def page_boc():
         hist = pd.concat([hist, pd.DataFrame([novo])], ignore_index=True)
         save_boc_df(hist)
         st.success("Solicitação de BOC registrada com sucesso.")
+        st.rerun()
 
-    hist = get_boc_df()
+    hist = get_boc_by_dt(dt)
     if not hist.empty:
         st.subheader("Histórico de solicitações BOC")
-        show = hist[hist["dt"].astype(str) == str(dt)].copy()
-        if show.empty:
-            st.info("Sem solicitações para esta DT.")
-        else:
-            st.dataframe(show.sort_values("data_hora", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(hist.sort_values("data_hora", ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sem solicitações para esta DT.")
 
 
 def page_gestao():
@@ -1638,7 +1754,14 @@ def page_gestao():
         st.info("Não há DTs divergentes para reabrir.")
         return
 
-    dt_reopen = st.selectbox("Selecione a DT divergente", dts_div)
+    query = st.text_input("Pesquisar DT divergente", key="gestao_div_query")
+    filtered = [d for d in dts_div if query.strip() in d] if query.strip() else dts_div
+
+    if not filtered:
+        st.info("Nenhuma DT divergente encontrada.")
+        return
+
+    dt_reopen = st.selectbox("DT divergente encontrada", filtered, key="gestao_reopen_select")
     if st.button("Reabrir DT"):
         snapshot = get_dt_snapshot(dt_reopen)
         if dt_can_reopen(snapshot):
@@ -1658,11 +1781,14 @@ if not st.session_state.get("auth_ok"):
 
 show_logo_sidebar()
 
+sections = allowed_sections()
+default_section = st.session_state.pop("menu_target", sections[0] if sections else "Conferência")
+default_index = sections.index(default_section) if default_section in sections else 0
+
 if st.sidebar.button("Sair", use_container_width=True):
     logout()
 
-sections = allowed_sections()
-section = st.sidebar.radio("Menu", sections)
+section = st.sidebar.radio("Menu", sections, index=default_index)
 
 if section == "Assistente":
     page_assistente()
