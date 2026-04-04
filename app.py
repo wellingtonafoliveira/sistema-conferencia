@@ -6,6 +6,7 @@ from datetime import datetime
 from io import BytesIO
 
 import pandas as pd
+import plotly.express as px
 import resend
 import streamlit as st
 from filelock import FileLock
@@ -172,7 +173,7 @@ def to_float_qty(value):
 
 
 def format_date_only(value):
-    if pd.isna(value) or str(value).strip() == "":
+    if pd.isna(value):
         return ""
     dt = pd.to_datetime(value, errors="coerce")
     if pd.isna(dt):
@@ -181,12 +182,15 @@ def format_date_only(value):
 
 
 def format_time_only(value):
-    if pd.isna(value) or str(value).strip() == "":
+    if pd.isna(value):
+        return ""
+    text = clean_str(value)
+    if not text:
         return ""
     dt = pd.to_datetime(value, errors="coerce")
-    if pd.isna(dt):
-        return clean_str(value)
-    return dt.strftime("%H:%M")
+    if pd.notna(dt):
+        return dt.strftime("%H:%M")
+    return text
 
 
 def compute_item_status(qtd_conferida, qtd_solicitada):
@@ -525,6 +529,10 @@ def build_management_df():
             "DT": dt,
             "Cliente": meta.get("cliente", ""),
             "Transportadora": meta.get("transportadora", ""),
+            "Tipo de carga": meta.get("tipo_carga", ""),
+            "Perfil carregamento": meta.get("perfil_carregamento", ""),
+            "Data agenda": meta.get("data_agenda", ""),
+            "Hora agenda": meta.get("hora_agenda", ""),
             "Remessas": int(items_df["remessa"].nunique()) if not items_df.empty else 0,
             "Conferente": meta.get("conferente", ""),
             "Turno": meta.get("turno", ""),
@@ -604,14 +612,326 @@ def page_assistente():
         c.metric("Remessas", base["remessa"].nunique())
         st.dataframe(base.head(50), use_container_width=True)
 
+    st.divider()
     st.subheader("Refazer conferência de DT divergente")
-    mgmt = build_management_df()
-    dts_div = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist() if not mgmt.empty else []
 
-    if dts_div:
-        dt_refazer = st.selectbox("Selecione a DT divergente", dts_div, key="dt_refazer_assistente")
-        if st.button("Refazer conferência", key="btn_refazer_assistente"):
-            snapshot = get_dt_snapshot(dt_refazer)
-            if dt_can_reopen(snapshot):
-                reopen_dt(dt_refazer)
-                st.success(f"DT {
+    mgmt = build_management_df()
+    if not mgmt.empty:
+        divergentes = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist()
+        if divergentes:
+            dt_refazer = st.selectbox("Selecione a DT divergente", divergentes, key="dt_refazer_assistente")
+            if st.button("Refazer conferência", key="btn_refazer_assistente"):
+                snapshot = get_dt_snapshot(dt_refazer)
+                if dt_can_reopen(snapshot):
+                    reopen_dt(dt_refazer)
+                    st.success(f"DT {dt_refazer} liberada para refazer conferência.")
+                    st.rerun()
+                else:
+                    st.error("Apenas DTs divergentes podem ser refeitas.")
+        else:
+            st.info("Não há DTs divergentes para refazer.")
+
+
+def page_conferencia():
+    st.title("Conferência")
+
+    base = get_base_vl06_df()
+    if base.empty:
+        st.info("Primeiro carregue a VL06 na área do Assistente.")
+        return
+
+    dt_list = get_dt_list()
+    search = st.text_input("Pesquisar DT")
+    filtered = [d for d in dt_list if search.strip() in d] if search.strip() else dt_list
+
+    if not filtered:
+        st.warning("Nenhuma DT encontrada.")
+        return
+
+    dt = st.selectbox("Selecione a DT", filtered)
+    snapshot = get_dt_snapshot(dt)
+    meta = snapshot["meta"]
+
+    items_df = snapshot_to_df(snapshot)
+    items_df = apply_statuses(items_df).sort_values(by=["remessa", "material"]).reset_index(drop=True)
+
+    qtd_skus_unicos = items_df["material"].astype(str).nunique()
+    total_caixas = int(items_df["qtd_solicitada"].fillna(0).sum())
+    data_agenda = meta.get("data_agenda", "")
+    hora_agenda = meta.get("hora_agenda", "")
+    perfil_carregamento = meta.get("perfil_carregamento", "")
+    tipo_carga = meta.get("tipo_carga", "")
+    metragem_cubica = float(items_df["metragem_cubica"].fillna(0).sum()) if "metragem_cubica" in items_df.columns else 0
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.info(f"**Cliente**\n\n{meta.get('cliente', '')}")
+    top2.info(f"**Transportadora**\n\n{meta.get('transportadora', '')}")
+    top3.info(f"**Status DT**\n\n{meta.get('status_dt', 'PENDENTE')}")
+    top4.info(f"**Remessas na DT**\n\n{meta.get('qtd_remessas', 0)}")
+
+    top5, top6, top7, top8 = st.columns(4)
+    top5.info(f"**SKU únicos**\n\n{qtd_skus_unicos}")
+    top6.info(f"**Total de caixas**\n\n{total_caixas}")
+    top7.info(f"**Data agenda**\n\n{data_agenda}")
+    top8.info(f"**Hora agenda**\n\n{hora_agenda}")
+
+    top9, top10, top11 = st.columns(3)
+    top9.info(f"**Perfil de carregamento**\n\n{perfil_carregamento}")
+    top10.info(f"**Tipo de carga**\n\n{tipo_carga}")
+    top11.info(f"**Metragem cúbica**\n\n{metragem_cubica:.3f} m³")
+
+    c1, c2, c3, c4 = st.columns(4)
+    conferente = c1.text_input("Conferente", value=meta.get("conferente", ""), key=f"conf_{dt}")
+    turno = c2.selectbox(
+        "Turno",
+        ["Manhã", "Tarde", "Noite"],
+        index=["Manhã", "Tarde", "Noite"].index(meta.get("turno", "Manhã")),
+        key=f"turno_{dt}",
+    )
+    c3.text_input("Início", value=meta.get("inicio", ""), disabled=True, key=f"inicio_{dt}")
+    c4.text_input("Fim", value=meta.get("fim", ""), disabled=True, key=f"fim_{dt}")
+
+    snapshot["meta"]["conferente"] = conferente
+    snapshot["meta"]["turno"] = turno
+    save_dt_snapshot(dt, snapshot)
+
+    if dt_locked(snapshot):
+        st.error("Esta DT foi finalizada sem divergência e está bloqueada.")
+    elif meta.get("status_dt") == "DIVERGENTE":
+        st.warning("Esta DT foi finalizada com divergência e pode ser reaberta pelo Assistente ou Gestão.")
+    else:
+        mark_dt_started(dt, conferente, turno)
+
+    sku_df = get_sku_df()
+    sku_map = dict(zip(sku_df["sku"].astype(str), sku_df["qtd_palete"].astype(int))) if not sku_df.empty else {}
+
+    st.subheader("Lançamento por palete")
+    x1, x2 = st.columns([3, 1])
+    codigo_bip = x1.text_input("Bipar SKU", key=f"bip_{dt}")
+
+    if x2.button("Lançar palete", disabled=dt_locked(get_dt_snapshot(dt)), key=f"btn_bip_{dt}"):
+        if not codigo_bip:
+            st.warning("Informe o SKU.")
+        elif codigo_bip not in sku_map:
+            st.error("SKU não cadastrado na base SKU.")
+        else:
+            qtd_palete = int(sku_map[codigo_bip])
+            mask = items_df["material"].astype(str) == str(codigo_bip)
+            if not mask.any():
+                st.error("SKU não encontrado nesta DT.")
+            else:
+                items_df.loc[mask, "qtd_conferida"] = items_df.loc[mask, "qtd_conferida"].astype(int) + qtd_palete
+                items_df = apply_statuses(items_df)
+                update_snapshot_items(dt, items_df)
+                st.success(f"{qtd_palete} unidades lançadas para o SKU {codigo_bip}.")
+                st.rerun()
+
+    st.subheader("Lançamento manual")
+    m1, m2, m3 = st.columns([2, 1, 1])
+    sku_manual = m1.text_input("SKU manual", key=f"sku_manual_{dt}")
+    qtd_manual = m2.number_input("Quantidade", min_value=1, step=1, key=f"qtd_manual_{dt}")
+
+    if m3.button("Adicionar manual", disabled=dt_locked(get_dt_snapshot(dt)), key=f"btn_manual_{dt}"):
+        mask = items_df["material"].astype(str) == str(sku_manual)
+        if not mask.any():
+            st.error("SKU não encontrado nesta DT.")
+        else:
+            items_df.loc[mask, "qtd_conferida"] = items_df.loc[mask, "qtd_conferida"].astype(int) + int(qtd_manual)
+            items_df = apply_statuses(items_df)
+            update_snapshot_items(dt, items_df)
+            st.success(f"{qtd_manual} unidades lançadas manualmente para o SKU {sku_manual}.")
+            st.rerun()
+
+    st.subheader("Itens da DT")
+    editor_df = items_df[[
+        "remessa", "doc_referencia", "material", "descricao",
+        "qtd_solicitada", "qtd_conferida", "status_item"
+    ]].copy()
+
+    edited_view = st.data_editor(
+        editor_df,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["remessa", "doc_referencia", "material", "descricao", "qtd_solicitada", "status_item"],
+        column_config={
+            "remessa": "Remessa",
+            "doc_referencia": "Documento referência",
+            "material": "SKU",
+            "descricao": "Descrição",
+            "qtd_solicitada": st.column_config.NumberColumn("Qtd Solicitada"),
+            "qtd_conferida": st.column_config.NumberColumn("Qtd Conferida", min_value=0, step=1),
+            "status_item": "Status",
+        },
+        key=f"editor_{dt}",
+    )
+
+    items_df["qtd_conferida"] = edited_view["qtd_conferida"].fillna(0).astype(int)
+    items_df = apply_statuses(items_df)
+    update_snapshot_items(dt, items_df)
+
+    ok_count = int((items_df["status_item"] == "OK").sum())
+    div_count = int((items_df["status_item"] == "DIVERGENTE").sum())
+    pen_count = int((items_df["status_item"] == "PENDENTE").sum())
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Itens OK", ok_count)
+    a2.metric("Itens divergentes", div_count)
+    a3.metric("Itens pendentes", pen_count)
+
+    has_divergence = div_count > 0
+
+    b1, b2, b3 = st.columns(3)
+
+    if b1.button("Gerar PDF", key=f"pdf_{dt}"):
+        pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
+        st.session_state["last_pdf_bytes"] = pdf_bytes
+        st.session_state["last_pdf_name"] = f"espelho_dt_{dt}.pdf"
+        st.success("PDF gerado.")
+
+    if st.session_state.get("last_pdf_bytes") and st.session_state.get("last_pdf_name"):
+        st.download_button(
+            "Baixar último PDF",
+            data=st.session_state["last_pdf_bytes"],
+            file_name=st.session_state["last_pdf_name"],
+            mime="application/pdf",
+            key=f"download_pdf_{dt}",
+        )
+
+    if b2.button("Finalizar conferência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_ok_{dt}"):
+        if has_divergence:
+            st.error("Existem divergências. Use a opção de finalizar com divergência.")
+        else:
+            finalize_dt(dt, "FINALIZADO", conferente, turno)
+            pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
+            file_name = f"espelho_dt_{dt}.pdf"
+            st.session_state["last_pdf_bytes"] = pdf_bytes
+            st.session_state["last_pdf_name"] = file_name
+
+            try:
+                send_pdf_email(pdf_bytes, file_name, dt, "FINALIZADO")
+                st.success("Conferência finalizada e PDF enviado por e-mail.")
+            except Exception as e:
+                st.warning(f"Conferência finalizada, mas houve erro no envio do e-mail: {e}")
+
+    if b3.button("Finalizar com divergência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_div_{dt}"):
+        finalize_dt(dt, "DIVERGENTE", conferente, turno)
+        pdf_bytes = generate_pdf_bytes(get_dt_snapshot(dt))
+        file_name = f"espelho_dt_{dt}.pdf"
+        st.session_state["last_pdf_bytes"] = pdf_bytes
+        st.session_state["last_pdf_name"] = file_name
+
+        try:
+            send_pdf_email(pdf_bytes, file_name, dt, "DIVERGENTE")
+            st.warning("Conferência finalizada com divergência e PDF enviado por e-mail.")
+        except Exception as e:
+            st.warning(f"Conferência finalizada com divergência, mas houve erro no envio do e-mail: {e}")
+
+
+def page_gestao():
+    st.title("Gestão")
+
+    base = get_base_vl06_df()
+    if base.empty:
+        st.info("Primeiro carregue a VL06 na área do Assistente.")
+        return
+
+    mgmt = build_management_df()
+    if mgmt.empty:
+        st.warning("Sem dados.")
+        return
+
+    # KPIs
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total DTs", len(mgmt))
+    c2.metric("Pendentes", int((mgmt["Status DT"] == "PENDENTE").sum()))
+    c3.metric("Em andamento", int((mgmt["Status DT"] == "EM_ANDAMENTO").sum()))
+    c4.metric("Finalizadas", int((mgmt["Status DT"] == "FINALIZADO").sum()))
+    c5.metric("Divergentes", int((mgmt["Status DT"] == "DIVERGENTE").sum()))
+
+    st.subheader("Dashboard")
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        status_counts = mgmt["Status DT"].value_counts().reset_index()
+        status_counts.columns = ["Status", "Quantidade"]
+        fig_status = px.pie(status_counts, names="Status", values="Quantidade", title="Status das DTs")
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with chart_col2:
+        fig_tipo = px.bar(
+            mgmt.groupby("Tipo de carga", dropna=False).size().reset_index(name="Quantidade"),
+            x="Tipo de carga",
+            y="Quantidade",
+            title="DTs por Tipo de Carga"
+        )
+        st.plotly_chart(fig_tipo, use_container_width=True)
+
+    chart_col3, chart_col4 = st.columns(2)
+
+    with chart_col3:
+        fig_conf = px.bar(
+            mgmt.groupby("Conferente", dropna=False).size().reset_index(name="DTs"),
+            x="Conferente",
+            y="DTs",
+            title="DTs por Conferente"
+        )
+        st.plotly_chart(fig_conf, use_container_width=True)
+
+    with chart_col4:
+        fig_caixas = px.bar(
+            mgmt.sort_values("Total caixas", ascending=False).head(10),
+            x="DT",
+            y="Total caixas",
+            title="Top 10 DTs por Total de Caixas"
+        )
+        st.plotly_chart(fig_caixas, use_container_width=True)
+
+    st.subheader("Fila de DTs")
+
+    filtro_status = st.selectbox("Filtrar por status", ["Todos", "PENDENTE", "EM_ANDAMENTO", "FINALIZADO", "DIVERGENTE"])
+    show_df = mgmt.copy()
+    if filtro_status != "Todos":
+        show_df = show_df[show_df["Status DT"] == filtro_status]
+
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Reabrir DT divergente")
+    dts_div = mgmt[mgmt["Status DT"] == "DIVERGENTE"]["DT"].tolist()
+    if not dts_div:
+        st.info("Não há DTs divergentes para reabrir.")
+        return
+
+    dt_reopen = st.selectbox("Selecione a DT divergente", dts_div)
+    if st.button("Reabrir DT"):
+        snapshot = get_dt_snapshot(dt_reopen)
+        if dt_can_reopen(snapshot):
+            reopen_dt(dt_reopen)
+            st.success(f"DT {dt_reopen} reaberta com sucesso.")
+            st.rerun()
+        else:
+            st.error("Só é permitido reabrir DT com status divergente.")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+if not st.session_state.get("auth_ok"):
+    login_screen()
+    st.stop()
+
+st.sidebar.success(f"Usuário: {st.session_state['usuario']}")
+st.sidebar.info(f"Perfil: {st.session_state['perfil']}")
+
+if st.sidebar.button("Sair"):
+    logout()
+
+sections = allowed_sections()
+section = st.sidebar.radio("Menu", sections)
+
+if section == "Assistente":
+    page_assistente()
+elif section == "Conferência":
+    page_conferencia()
+elif section == "Gestão":
+    page_gestao()
