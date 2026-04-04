@@ -5,3 +5,4 @@ reportlab
 resend
 filelock
 plotly
+Cloudinary
