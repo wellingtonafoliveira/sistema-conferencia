@@ -231,6 +231,8 @@ def allowed_sections():
         return ["Assistente", "Conferência", "Insumos CP", "Solicitação BOC"]
     if perfil == "conferente":
         return ["Conferência", "Insumos CP", "Solicitação BOC"]
+        if perfil == "faturista":
+        return ["Faturista", "Insumos CP", "Solicitação BOC"]
     if perfil == "gestao":
         return ["Gestão", "Conferência", "Insumos CP", "Solicitação BOC"]
     return []
