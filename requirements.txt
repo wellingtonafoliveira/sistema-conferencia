@@ -1,8 +1,8 @@
 streamlit
 pandas
-plotly
-filelock
 reportlab
-cloudinary
 openpyxl
-xlrd
+cloudinary
+plotly
+qrcode
+pillow
