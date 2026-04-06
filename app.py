@@ -55,10 +55,6 @@ REQUIRED_VL06_COLUMNS = [
     "Tipo de carga",
 ]
 
-resend.api_key = st.secrets["resend"]["api_key"]
-EMAIL_FROM = st.secrets["email"]["from_email"]
-EMAIL_TO = st.secrets["email"]["to_email"]
-
 cloudinary.config(
     cloud_name=st.secrets["cloudinary"]["cloud_name"],
     api_key=st.secrets["cloudinary"]["api_key"],
