@@ -236,6 +236,10 @@ def allowed_sections():
     return []
 
 
+def is_assistente():
+    return st.session_state.get("perfil", "") == "assistente"
+
+
 # =========================================================
 # UTILS
 # =========================================================
@@ -787,7 +791,7 @@ def _signature_cell(name, role):
     )
     name = clean_str(name)
     role = clean_str(role)
-    text = f"Linha de assinatura<br/>{name}<br/>{role}"
+    text = f"{name}<br/>{role}"
     return Paragraph(text, style)
 
 
@@ -1569,26 +1573,51 @@ def page_insumos_cp():
     quadro_sem_ripa = col3.number_input("Quadro sem ripa", min_value=0, step=1, value=int(ult.get("quadro_sem_ripa", 0) or 0), key="insumo_qsr")
     quadro_com_ripa = col4.number_input("Quadro com ripa", min_value=0, step=1, value=int(ult.get("quadro_com_ripa", 0) or 0), key="insumo_qcr")
 
-    if st.button("Salvar insumos CP", use_container_width=True):
-        if tipo_carga != "CP":
-            st.error("Somente DTs do tipo CP podem registrar insumos nesta tela.")
-        else:
-            delete_insumos_by_dt(dt)
-            novo = {
-                "data_hora": now_sp_str(),
-                "usuario": st.session_state.get("usuario", ""),
-                "dt": dt,
-                "tipo_carga": tipo_carga,
-                "palete": int(palete),
-                "chapa": int(chapa),
-                "quadro_sem_ripa": int(quadro_sem_ripa),
-                "quadro_com_ripa": int(quadro_com_ripa),
-            }
+    btn1, btn2 = st.columns(2)
 
-            hist = get_insumos_df()
-            hist = pd.concat([hist, pd.DataFrame([novo])], ignore_index=True)
-            save_insumos_df(hist)
-            st.success("Insumos CP lançados com sucesso.")
+    with btn1:
+        if st.button("Salvar insumos CP", use_container_width=True):
+            if tipo_carga != "CP":
+                st.error("Somente DTs do tipo CP podem registrar insumos nesta tela.")
+            else:
+                if ult:
+                    hist = get_insumos_df()
+                    idx = hist.index[hist["dt"].astype(str) == str(dt)].tolist()
+                    if idx:
+                        last_idx = idx[-1]
+                        hist.at[last_idx, "data_hora"] = now_sp_str()
+                        hist.at[last_idx, "usuario"] = st.session_state.get("usuario", "")
+                        hist.at[last_idx, "tipo_carga"] = tipo_carga
+                        hist.at[last_idx, "palete"] = int(palete)
+                        hist.at[last_idx, "chapa"] = int(chapa)
+                        hist.at[last_idx, "quadro_sem_ripa"] = int(quadro_sem_ripa)
+                        hist.at[last_idx, "quadro_com_ripa"] = int(quadro_com_ripa)
+                        save_insumos_df(hist)
+                        st.success("Insumos CP atualizados com sucesso.")
+                        st.rerun()
+                else:
+                    novo = {
+                        "data_hora": now_sp_str(),
+                        "usuario": st.session_state.get("usuario", ""),
+                        "dt": dt,
+                        "tipo_carga": tipo_carga,
+                        "palete": int(palete),
+                        "chapa": int(chapa),
+                        "quadro_sem_ripa": int(quadro_sem_ripa),
+                        "quadro_com_ripa": int(quadro_com_ripa),
+                    }
+                    hist = get_insumos_df()
+                    hist = pd.concat([hist, pd.DataFrame([novo])], ignore_index=True)
+                    save_insumos_df(hist)
+                    st.success("Insumos CP lançados com sucesso.")
+                    st.rerun()
+
+    with btn2:
+        if ult and st.button("Limpar campos", use_container_width=True):
+            st.session_state["insumo_palete"] = 0
+            st.session_state["insumo_chapa"] = 0
+            st.session_state["insumo_qsr"] = 0
+            st.session_state["insumo_qcr"] = 0
             st.rerun()
 
     hist = get_insumos_by_dt(dt)
@@ -1656,7 +1685,46 @@ def page_boc():
     hist = get_boc_by_dt(dt)
     if not hist.empty:
         st.subheader("Histórico de solicitações BOC")
-        st.dataframe(hist.sort_values("data_hora", ascending=False), use_container_width=True, hide_index=True)
+        hist_show = hist.sort_values("data_hora", ascending=False).copy()
+        st.dataframe(hist_show, use_container_width=True, hide_index=True)
+
+        if is_assistente():
+            st.subheader("Excluir BOC")
+            hist_show = hist_show.reset_index(drop=True)
+            hist_show["label_exclusao"] = hist_show.apply(
+                lambda row: f"{row['data_hora']} | Remessa {row['remessa']} | Item {row['item']} | Qtd {row['qtd']}",
+                axis=1,
+            )
+            escolha = st.selectbox(
+                "Selecione o BOC para excluir",
+                hist_show["label_exclusao"].tolist(),
+                key="boc_delete_select",
+            )
+
+            motivo = st.text_input("Motivo da exclusão", key="boc_delete_reason")
+
+            if st.button("Excluir BOC selecionado", use_container_width=True, key="btn_delete_boc"):
+                if not motivo.strip():
+                    st.error("Informe o motivo da exclusão.")
+                else:
+                    idx_sel = hist_show[hist_show["label_exclusao"] == escolha].index[0]
+                    row_sel = hist_show.loc[idx_sel]
+
+                    full_hist = get_boc_df().copy()
+                    mask = (
+                        (full_hist["dt"].astype(str) == str(row_sel["dt"])) &
+                        (full_hist["data_hora"].astype(str) == str(row_sel["data_hora"])) &
+                        (full_hist["remessa"].astype(str) == str(row_sel["remessa"])) &
+                        (full_hist["item"].astype(str) == str(row_sel["item"])) &
+                        (full_hist["qtd"].astype(str) == str(row_sel["qtd"]))
+                    )
+                    full_hist = full_hist[~mask].copy()
+                    save_boc_df(full_hist)
+
+                    st.success(f"BOC excluído pelo assistente. Motivo: {motivo}")
+                    st.rerun()
+        else:
+            st.info("A exclusão de BOC é permitida apenas para o perfil assistente.")
     else:
         st.info("Sem solicitações para esta DT.")
 
