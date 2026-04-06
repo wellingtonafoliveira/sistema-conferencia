@@ -6,3 +6,4 @@ cloudinary
 plotly
 qrcode
 pillow
+pytz
