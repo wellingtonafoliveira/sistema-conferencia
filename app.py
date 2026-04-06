@@ -11,7 +11,6 @@ import cloudinary
 import cloudinary.uploader
 import pandas as pd
 import plotly.express as px
-import resend
 import streamlit as st
 from filelock import FileLock
 from reportlab.lib import colors, utils
