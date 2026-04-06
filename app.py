@@ -323,8 +323,8 @@ def build_pdf_bytes(dt, df_itens, insumos, boc, meta, qr_path=None):
             str(row.get("doc_ref", "")),
             str(row["sku"]),
             str(row.get("descricao", "")),
-            str(int(row["sol"])),
-            str(int(row["conf"])),
+            str(int(row["Qtd.Solicitada"])),
+            str(int(row["Qtd.Conferida"])),
             status,
         ])
 
