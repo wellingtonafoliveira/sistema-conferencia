@@ -6,4 +6,3 @@ reportlab
 cloudinary
 openpyxl
 xlrd
-firebase-admin
