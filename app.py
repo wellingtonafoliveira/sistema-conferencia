@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import tempfile
@@ -18,14 +17,8 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import (
-    Image,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
 
 # =========================================================
 # CONFIG
@@ -91,7 +84,7 @@ def info_card(label, value):
                 {label}
             </div>
             <div style="font-size: 18px; color: #0f172a; font-weight: 700;">
-                {value if value not in [None, ''] else '-'}
+                {value if value not in [None, ""] else "-"}
             </div>
         </div>
         """,
@@ -147,6 +140,8 @@ def default_store():
         "base_vl06": [],
         "sku_base": [],
         "conferencias": {},
+        "insumos_cp": [],
+        "boc_solicitacoes": [],
     }
 
 
@@ -204,11 +199,11 @@ def logout():
 def allowed_sections():
     perfil = st.session_state.get("perfil", "")
     if perfil == "assistente":
-        return ["Assistente", "Conferência"]
+        return ["Assistente", "Conferência", "Insumos CP", "Solicitação BOC"]
     if perfil == "conferente":
-        return ["Conferência"]
+        return ["Conferência", "Insumos CP", "Solicitação BOC"]
     if perfil == "gestao":
-        return ["Gestão", "Conferência"]
+        return ["Gestão", "Conferência", "Insumos CP", "Solicitação BOC"]
     return []
 
 
@@ -229,7 +224,7 @@ def clean_id(value):
     if not text:
         return ""
     try:
-        num = float(text.replace(",", "."))
+        num = float(str(text).replace(",", "."))
         if num.is_integer():
             return str(int(num))
     except Exception:
@@ -286,11 +281,9 @@ def format_time_only(value):
     text = clean_str(value)
     if not text:
         return ""
-
     dt = pd.to_datetime(value, errors="coerce")
     if pd.notna(dt):
         return dt.strftime("%H:%M")
-
     return text
 
 
@@ -311,6 +304,10 @@ def apply_statuses(df):
         axis=1,
     )
     return out
+
+
+def get_remaining_qty(row):
+    return max(int(row["qtd_solicitada"]) - int(row["qtd_conferida"]), 0)
 
 
 # =========================================================
@@ -360,29 +357,39 @@ def normalize_vl06(df_raw):
 
 def normalize_sku_base(df_raw):
     df = df_raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    lower_map = {c.lower(): c for c in df.columns}
+    df = df.dropna(how="all").copy()
 
-    def find_col(options):
-        for opt in options:
-            if opt in lower_map:
-                return lower_map[opt]
-        return None
+    header_row = None
+    for idx in range(min(10, len(df))):
+        row_vals = [clean_str(v) for v in df.iloc[idx].tolist()]
+        if "SKU" in row_vals and "Quantidade por palete" in row_vals:
+            header_row = idx
+            break
 
-    sku_col = find_col(["sku", "material", "codigo", "código", "item"])
-    desc_col = find_col(["descricao", "descrição", "denominação", "descricao item"])
-    qtd_col = find_col(["qtd_palete", "qtd por palete", "quantidade por palete", "quantidade", "qtd"])
+    if header_row is None:
+        raise ValueError("Não foi possível localizar o cabeçalho da base SKU.")
 
-    if not sku_col or not qtd_col:
-        raise ValueError("A base SKU precisa ter ao menos as colunas SKU e quantidade por palete.")
+    df.columns = [clean_str(c) for c in df.iloc[header_row].tolist()]
+    df = df.iloc[header_row + 1:].copy()
+    df = df.reset_index(drop=True)
+
+    if "SKU" not in df.columns or "Quantidade por palete" not in df.columns:
+        raise ValueError("A base SKU precisa conter as colunas 'SKU' e 'Quantidade por palete'.")
+
+    desc_col = "Descrição" if "Descrição" in df.columns else None
 
     out = pd.DataFrame({
-        "sku": df[sku_col].apply(clean_id),
+        "sku": df["SKU"].apply(clean_id),
         "descricao": df[desc_col].apply(clean_str) if desc_col else "",
-        "qtd_palete": df[qtd_col].apply(to_int_qty),
+        "qtd_palete": df["Quantidade por palete"].apply(to_int_qty),
     })
 
-    out = out[(out["sku"] != "") & (out["qtd_palete"] > 0)].drop_duplicates(subset=["sku"]).reset_index(drop=True)
+    out = out[(out["sku"] != "") & (out["qtd_palete"] > 0)].copy()
+    out = out.drop_duplicates(subset=["sku"]).reset_index(drop=True)
+
+    if out.empty:
+        raise ValueError("Nenhum SKU válido com quantidade por palete foi encontrado.")
+
     return out
 
 
@@ -424,6 +431,30 @@ def save_conferencias(confs):
     save_store(store)
 
 
+def get_insumos_df():
+    store = load_store()
+    rows = store.get("insumos_cp", [])
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def save_insumos_df(df):
+    store = load_store()
+    store["insumos_cp"] = df.to_dict(orient="records")
+    save_store(store)
+
+
+def get_boc_df():
+    store = load_store()
+    rows = store.get("boc_solicitacoes", [])
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def save_boc_df(df):
+    store = load_store()
+    store["boc_solicitacoes"] = df.to_dict(orient="records")
+    save_store(store)
+
+
 def get_dt_list():
     base = get_base_vl06_df()
     if base.empty:
@@ -435,14 +466,11 @@ def get_dt_snapshot(dt):
     confs = get_conferencias()
     if dt in confs:
         snapshot = confs[dt]
-        if "pdf_url" not in snapshot["meta"]:
-            snapshot["meta"]["pdf_url"] = ""
-        if "pdf_public_id" not in snapshot["meta"]:
-            snapshot["meta"]["pdf_public_id"] = ""
-        if "assinatura_conferente" not in snapshot["meta"]:
-            snapshot["meta"]["assinatura_conferente"] = ""
-        if "assinatura_lider" not in snapshot["meta"]:
-            snapshot["meta"]["assinatura_lider"] = ""
+        meta = snapshot.setdefault("meta", {})
+        meta.setdefault("pdf_url", "")
+        meta.setdefault("pdf_public_id", "")
+        meta.setdefault("assinatura_conferente", "")
+        meta.setdefault("assinatura_lider", "")
         return snapshot
 
     base = get_base_vl06_df()
@@ -493,10 +521,12 @@ def snapshot_to_df(snapshot):
 def update_snapshot_items(dt, df_items):
     snapshot = deepcopy(get_dt_snapshot(dt))
     snapshot["items"] = apply_statuses(df_items).to_dict(orient="records")
-
     snapshot["meta"]["total_caixas"] = int(pd.to_numeric(df_items["qtd_solicitada"], errors="coerce").fillna(0).sum())
+
     if "metragem_cubica" in df_items.columns:
-        snapshot["meta"]["metragem_cubica"] = float(pd.to_numeric(df_items["metragem_cubica"], errors="coerce").fillna(0).sum())
+        snapshot["meta"]["metragem_cubica"] = float(
+            pd.to_numeric(df_items["metragem_cubica"], errors="coerce").fillna(0).sum()
+        )
 
     save_dt_snapshot(dt, snapshot)
 
@@ -535,12 +565,75 @@ def finalize_dt(dt, final_status, conferente, turno, assinatura_conferente="", a
     save_dt_snapshot(dt, snapshot)
 
 
+def reset_dt_conferencia(dt):
+    snapshot = deepcopy(get_dt_snapshot(dt))
+    items_df = snapshot_to_df(snapshot)
+
+    if items_df.empty:
+        return
+
+    items_df["qtd_conferida"] = 0
+    items_df["status_item"] = "PENDENTE"
+
+    snapshot["items"] = items_df.to_dict(orient="records")
+    snapshot["meta"]["inicio"] = ""
+    snapshot["meta"]["fim"] = ""
+    snapshot["meta"]["status_dt"] = "PENDENTE"
+    snapshot["meta"]["conferente"] = ""
+    snapshot["meta"]["turno"] = "Manhã"
+    snapshot["meta"]["pdf_url"] = ""
+    snapshot["meta"]["pdf_public_id"] = ""
+    snapshot["meta"]["assinatura_conferente"] = ""
+    snapshot["meta"]["assinatura_lider"] = ""
+
+    save_dt_snapshot(dt, snapshot)
+
+
 def reopen_dt(dt):
     snapshot = deepcopy(get_dt_snapshot(dt))
     if snapshot["meta"]["status_dt"] == "DIVERGENTE":
-        snapshot["meta"]["status_dt"] = "EM_ANDAMENTO"
-        snapshot["meta"]["fim"] = ""
-        save_dt_snapshot(dt, snapshot)
+        reset_dt_conferencia(dt)
+
+
+# =========================================================
+# LANÇAMENTO HO / HE
+# =========================================================
+def lancar_quantidade_sku(df_items, sku, quantidade):
+    if quantidade <= 0:
+        return df_items, False, "Quantidade deve ser maior que zero."
+
+    df = df_items.copy()
+    df["material"] = df["material"].astype(str)
+
+    sku = str(sku).strip()
+    match_idx = df.index[df["material"] == sku].tolist()
+
+    if not match_idx:
+        return df_items, False, "SKU não encontrado nesta DT."
+
+    restante_para_lancar = int(quantidade)
+
+    for idx in match_idx:
+        qtd_solicitada = int(df.at[idx, "qtd_solicitada"])
+        qtd_conferida = int(df.at[idx, "qtd_conferida"])
+        saldo = max(qtd_solicitada - qtd_conferida, 0)
+
+        if saldo <= 0:
+            continue
+
+        adicionar = min(saldo, restante_para_lancar)
+        df.at[idx, "qtd_conferida"] = qtd_conferida + adicionar
+        restante_para_lancar -= adicionar
+
+        if restante_para_lancar <= 0:
+            break
+
+    if restante_para_lancar > 0:
+        ultimo_idx = match_idx[-1]
+        df.at[ultimo_idx, "qtd_conferida"] = int(df.at[ultimo_idx, "qtd_conferida"]) + restante_para_lancar
+
+    df = apply_statuses(df)
+    return df, True, ""
 
 
 # =========================================================
@@ -569,7 +662,7 @@ def upload_pdf_to_cloudinary(pdf_bytes, filename, folder="espelhos_conferencia")
 
 
 # =========================================================
-# PDF + EMAIL
+# PDF
 # =========================================================
 def get_image_dimensions(path, width=None, height=None):
     img = utils.ImageReader(path)
@@ -728,10 +821,7 @@ def generate_pdf_bytes(snapshot):
     assinatura_lider = meta.get("assinatura_lider", "")
 
     signature_table = Table([
-        [
-            "",
-            "",
-        ],
+        ["", ""],
         [
             f"________________________________________<br/>{assinatura_conferente}<br/>Assinatura do Conferente",
             f"________________________________________<br/>{assinatura_lider}<br/>Assinatura da Liderança / Responsável",
@@ -755,32 +845,6 @@ def generate_pdf_bytes(snapshot):
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
-
-
-def send_pdf_email(pdf_bytes, filename, dt, status_dt, pdf_url=""):
-    attachment_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    link_html = f'<p><a href="{pdf_url}" target="_blank">Abrir PDF salvo online</a></p>' if pdf_url else ""
-
-    params = {
-        "from": EMAIL_FROM,
-        "to": [EMAIL_TO],
-        "subject": f"Conferência DT {dt} - {status_dt}",
-        "html": f"""
-            <strong>Conferência finalizada</strong>
-            <p><strong>DT:</strong> {dt}</p>
-            <p><strong>Status:</strong> {status_dt}</p>
-            {link_html}
-        """,
-        "attachments": [
-            {
-                "filename": filename,
-                "content": attachment_b64,
-            }
-        ],
-    }
-
-    return resend.Emails.send(params)
 
 
 # =========================================================
@@ -939,13 +1003,13 @@ def page_assistente():
 
         if sku_file is not None:
             try:
-                raw = pd.read_csv(sku_file) if sku_file.name.lower().endswith(".csv") else pd.read_excel(sku_file)
+                raw = pd.read_csv(sku_file) if sku_file.name.lower().endswith(".csv") else pd.read_excel(sku_file, header=None)
                 normalized = normalize_sku_base(raw)
 
                 if st.button("Processar base SKU", key="process_sku"):
                     save_sku_df(normalized)
                     st.success(f"Base SKU carregada com {len(normalized)} itens.")
-                    st.dataframe(normalized.head(20), use_container_width=True)
+                    st.dataframe(normalized.head(20), use_container_width=True, hide_index=True)
             except Exception as e:
                 st.error(f"Erro ao processar base SKU: {e}")
 
@@ -971,7 +1035,7 @@ def page_assistente():
                 snapshot = get_dt_snapshot(dt_refazer)
                 if dt_can_reopen(snapshot):
                     reopen_dt(dt_refazer)
-                    st.success(f"DT {dt_refazer} liberada para refazer conferência.")
+                    st.success(f"DT {dt_refazer} reaberta com conferência zerada. Pronta para iniciar do zero.")
                     st.rerun()
                 else:
                     st.error("Apenas DTs divergentes podem ser refeitas.")
@@ -1088,44 +1152,48 @@ def page_conferencia():
         mark_dt_started(dt, conferente, turno)
 
     sku_df = get_sku_df()
-    sku_map = dict(zip(sku_df["sku"].astype(str), sku_df["qtd_palete"].astype(int))) if not sku_df.empty else {}
+    if sku_df.empty:
+        st.warning("Carregue a base SKU para habilitar o lançamento por HO e HE.")
+    else:
+        sku_map = dict(zip(sku_df["sku"].astype(str), sku_df["qtd_palete"].astype(int)))
+        desc_map = dict(zip(sku_df["sku"].astype(str), sku_df["descricao"].astype(str)))
 
-    st.subheader("Lançamento por palete")
-    x1, x2 = st.columns([3, 1])
-    codigo_bip = x1.text_input("Bipar SKU", key=f"bip_{dt}")
+        st.subheader("Lançamento de Conferência")
+        l1, l2, l3, l4 = st.columns([2, 1, 1, 1])
 
-    if x2.button("Lançar palete", disabled=dt_locked(get_dt_snapshot(dt)), key=f"btn_bip_{dt}"):
-        if not codigo_bip:
-            st.warning("Informe o SKU.")
-        elif codigo_bip not in sku_map:
-            st.error("SKU não cadastrado na base SKU.")
-        else:
-            qtd_palete = int(sku_map[codigo_bip])
-            mask = items_df["material"].astype(str) == str(codigo_bip)
-            if not mask.any():
-                st.error("SKU não encontrado nesta DT.")
+        sku_lanc = l1.text_input("SKU", key=f"sku_lanc_{dt}")
+        ho_paletes = l2.number_input("HO (qtde de paletes)", min_value=0, step=1, key=f"ho_{dt}")
+        he_qtd = l3.number_input("HE (qtde fracionada)", min_value=0, step=1, key=f"he_{dt}")
+
+        if l4.button("Lançar", disabled=dt_locked(get_dt_snapshot(dt)), key=f"btn_lancar_ho_he_{dt}"):
+            sku_digitado = clean_id(sku_lanc)
+
+            if not sku_digitado:
+                st.warning("Informe o SKU.")
+            elif sku_digitado not in sku_map:
+                st.error("SKU não cadastrado na base SKU.")
             else:
-                items_df.loc[mask, "qtd_conferida"] = items_df.loc[mask, "qtd_conferida"].astype(int) + qtd_palete
-                items_df = apply_statuses(items_df)
-                update_snapshot_items(dt, items_df)
-                st.success(f"{qtd_palete} unidades lançadas para o SKU {codigo_bip}.")
-                st.rerun()
+                qtd_por_palete = int(sku_map[sku_digitado])
+                qtd_ho = int(ho_paletes) * qtd_por_palete
+                qtd_he = int(he_qtd)
+                qtd_total = qtd_ho + qtd_he
 
-    st.subheader("Lançamento manual")
-    m1, m2, m3 = st.columns([2, 1, 1])
-    sku_manual = m1.text_input("SKU manual", key=f"sku_manual_{dt}")
-    qtd_manual = m2.number_input("Quantidade", min_value=1, step=1, key=f"qtd_manual_{dt}")
-
-    if m3.button("Adicionar manual", disabled=dt_locked(get_dt_snapshot(dt)), key=f"btn_manual_{dt}"):
-        mask = items_df["material"].astype(str) == str(sku_manual)
-        if not mask.any():
-            st.error("SKU não encontrado nesta DT.")
-        else:
-            items_df.loc[mask, "qtd_conferida"] = items_df.loc[mask, "qtd_conferida"].astype(int) + int(qtd_manual)
-            items_df = apply_statuses(items_df)
-            update_snapshot_items(dt, items_df)
-            st.success(f"{qtd_manual} unidades lançadas manualmente para o SKU {sku_manual}.")
-            st.rerun()
+                if qtd_total <= 0:
+                    st.warning("Informe HO e/ou HE para lançar.")
+                else:
+                    novo_df, ok, msg = lancar_quantidade_sku(items_df, sku_digitado, qtd_total)
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        update_snapshot_items(dt, novo_df)
+                        desc = desc_map.get(sku_digitado, "")
+                        st.success(
+                            f"Lançamento realizado para SKU {sku_digitado} - {desc}. "
+                            f"HO: {ho_paletes} palete(s) = {qtd_ho} caixas | "
+                            f"HE: {qtd_he} caixa(s) | "
+                            f"Total lançado: {qtd_total}."
+                        )
+                        st.rerun()
 
     st.subheader("Itens da DT")
     editor_df = items_df[[
@@ -1218,11 +1286,10 @@ def page_conferencia():
                 snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
                 save_dt_snapshot(dt, snapshot_final)
 
-                send_pdf_email(pdf_bytes, file_name, dt, "FINALIZADO", cloud_result["url"])
-                st.success("Conferência finalizada, PDF salvo online e enviado por e-mail.")
+                st.success("Conferência finalizada e PDF salvo online com sucesso.")
                 st.rerun()
             except Exception as e:
-                st.warning(f"Conferência finalizada, mas houve erro ao salvar/enviar PDF: {e}")
+                st.warning(f"Conferência finalizada, mas houve erro ao salvar o PDF online: {e}")
 
     if b3.button("Finalizar com divergência", disabled=dt_locked(get_dt_snapshot(dt)), key=f"final_div_{dt}"):
         finalize_dt(
@@ -1247,11 +1314,121 @@ def page_conferencia():
             snapshot_final["meta"]["pdf_public_id"] = cloud_result["public_id"]
             save_dt_snapshot(dt, snapshot_final)
 
-            send_pdf_email(pdf_bytes, file_name, dt, "DIVERGENTE", cloud_result["url"])
-            st.warning("Conferência finalizada com divergência, PDF salvo online e enviado por e-mail.")
+            st.warning("Conferência finalizada com divergência e PDF salvo online.")
             st.rerun()
         except Exception as e:
-            st.warning(f"Conferência finalizada com divergência, mas houve erro ao salvar/enviar PDF: {e}")
+            st.warning(f"Conferência finalizada com divergência, mas houve erro ao salvar o PDF online: {e}")
+
+
+def page_insumos_cp():
+    show_logo_main()
+    st.title("Lançamento de Insumos CP")
+    st.caption("Utilize esta opção para cargas paletizadas (CP)")
+
+    base = get_base_vl06_df()
+    if base.empty:
+        st.info("Primeiro carregue a VL06 na área do Assistente.")
+        return
+
+    dt_list = get_dt_list()
+    dt = st.selectbox("Selecione a DT", dt_list, key="dt_insumos_cp")
+
+    snapshot = get_dt_snapshot(dt)
+    tipo_carga = snapshot["meta"].get("tipo_carga", "")
+
+    st.info(f"Tipo de carga da DT: {tipo_carga if tipo_carga else '-'}")
+
+    col1, col2, col3, col4 = st.columns(4)
+    palete = col1.number_input("Palete", min_value=0, step=1, key="insumo_palete")
+    chapa = col2.number_input("Chapa", min_value=0, step=1, key="insumo_chapa")
+    quadro_sem_ripa = col3.number_input("Quadro sem ripa", min_value=0, step=1, key="insumo_qsr")
+    quadro_com_ripa = col4.number_input("Quadro com ripa", min_value=0, step=1, key="insumo_qcr")
+
+    if st.button("Salvar insumos CP", use_container_width=True):
+        novo = {
+            "data_hora": now_sp_str(),
+            "usuario": st.session_state.get("usuario", ""),
+            "dt": dt,
+            "tipo_carga": tipo_carga,
+            "palete": int(palete),
+            "chapa": int(chapa),
+            "quadro_sem_ripa": int(quadro_sem_ripa),
+            "quadro_com_ripa": int(quadro_com_ripa),
+        }
+
+        hist = get_insumos_df()
+        hist = pd.concat([hist, pd.DataFrame([novo])], ignore_index=True)
+        save_insumos_df(hist)
+        st.success("Insumos CP lançados com sucesso.")
+
+    hist = get_insumos_df()
+    if not hist.empty:
+        st.subheader("Histórico de insumos")
+        show = hist[hist["dt"].astype(str) == str(dt)].copy()
+        if show.empty:
+            st.info("Sem lançamentos para esta DT.")
+        else:
+            st.dataframe(show.sort_values("data_hora", ascending=False), use_container_width=True, hide_index=True)
+
+
+def page_boc():
+    show_logo_main()
+    st.title("Solicitação de BOC")
+    st.caption("Utilize quando um item não for carregado na totalidade por falta de caixas")
+
+    base = get_base_vl06_df()
+    if base.empty:
+        st.info("Primeiro carregue a VL06 na área do Assistente.")
+        return
+
+    dt_list = get_dt_list()
+    dt = st.selectbox("Selecione a DT", dt_list, key="dt_boc")
+
+    snapshot = get_dt_snapshot(dt)
+    items_df = snapshot_to_df(snapshot).copy()
+
+    if items_df.empty:
+        st.warning("Sem itens nesta DT.")
+        return
+
+    remessas = sorted(items_df["remessa"].astype(str).unique().tolist())
+    remessa = st.selectbox("Remessa", remessas, key="boc_remessa")
+
+    itens_remessa = items_df[items_df["remessa"].astype(str) == str(remessa)].copy()
+    itens_remessa["item_label"] = (
+        itens_remessa["material"].astype(str) + " - " + itens_remessa["descricao"].astype(str)
+    )
+
+    item_label = st.selectbox("Item", itens_remessa["item_label"].tolist(), key="boc_item")
+    qtd = st.number_input("Qtd", min_value=1, step=1, key="boc_qtd")
+
+    if st.button("Salvar solicitação BOC", use_container_width=True):
+        sku_sel = item_label.split(" - ")[0].strip()
+        desc_sel = " - ".join(item_label.split(" - ")[1:]).strip()
+
+        novo = {
+            "data_hora": now_sp_str(),
+            "usuario": st.session_state.get("usuario", ""),
+            "dt": dt,
+            "remessa": remessa,
+            "item": sku_sel,
+            "descricao": desc_sel,
+            "qtd": int(qtd),
+        }
+
+        hist = get_boc_df()
+        hist = pd.concat([hist, pd.DataFrame([novo])], ignore_index=True)
+        save_boc_df(hist)
+        st.success("Solicitação de BOC registrada com sucesso.")
+
+    hist = get_boc_df()
+    if not hist.empty:
+        st.subheader("Histórico de solicitações BOC")
+        show = hist[hist["dt"].astype(str) == str(dt)].copy()
+        if show.empty:
+            st.info("Sem solicitações para esta DT.")
+        else:
+            st.dataframe(show.sort_values("data_hora", ascending=False), use_container_width=True, hide_index=True)
 
 
 def page_gestao():
@@ -1352,7 +1529,7 @@ def page_gestao():
         snapshot = get_dt_snapshot(dt_reopen)
         if dt_can_reopen(snapshot):
             reopen_dt(dt_reopen)
-            st.success(f"DT {dt_reopen} reaberta com sucesso.")
+            st.success(f"DT {dt_reopen} reaberta e zerada com sucesso.")
             st.rerun()
         else:
             st.error("Só é permitido reabrir DT com status divergente.")
@@ -1366,10 +1543,8 @@ if not st.session_state.get("auth_ok"):
     st.stop()
 
 show_logo_sidebar()
-st.sidebar.success(f"Usuário: {st.session_state['usuario']}")
-st.sidebar.info(f"Perfil: {st.session_state['perfil']}")
 
-if st.sidebar.button("Sair"):
+if st.sidebar.button("Sair", use_container_width=True):
     logout()
 
 sections = allowed_sections()
@@ -1379,5 +1554,9 @@ if section == "Assistente":
     page_assistente()
 elif section == "Conferência":
     page_conferencia()
+elif section == "Insumos CP":
+    page_insumos_cp()
+elif section == "Solicitação BOC":
+    page_boc()
 elif section == "Gestão":
     page_gestao()
