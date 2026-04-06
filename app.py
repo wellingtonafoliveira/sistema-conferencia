@@ -984,7 +984,7 @@ op = st.sidebar.radio("Menu", sections, index=index_default)
 if op == "Assistente":
     page_assistente()
 elif op == "Conferência":
-    page_conferencia(true)
+    page_conferencia(True)
 elif op == "Coletor":
     page_conferencia(True)
 elif op == "Insumos":
