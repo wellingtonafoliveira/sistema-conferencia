@@ -1,7 +1,7 @@
+
 import json
 import os
 import tempfile
-from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -12,7 +12,6 @@ import pandas as pd
 import plotly.express as px
 import qrcode
 import streamlit as st
-from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
@@ -28,16 +27,26 @@ st.set_page_config(page_title="Sistema de Conferência", layout="wide")
 
 APP_TZ = ZoneInfo("America/Sao_Paulo")
 DB_FILE = "db.json"
-VL06_FILE = "vl06.csv"
-SKU_FILE = "sku.csv"
+VL06_FILE = "base_vl06.xlsx"
+SKU_FILE = "BASE SKU.xlsx"
 LOGO_FILE = "Nadir.png"
 
-cloudinary.config(
-    cloud_name=st.secrets["cloudinary"]["cloud_name"],
-    api_key=st.secrets["cloudinary"]["api_key"],
-    api_secret=st.secrets["cloudinary"]["api_secret"],
-    secure=True,
-)
+
+# =========================================================
+# CLOUDINARY
+# =========================================================
+def cloudinary_ready():
+    try:
+        cloudinary.config(
+            cloud_name=st.secrets["cloudinary"]["cloud_name"],
+            api_key=st.secrets["cloudinary"]["api_key"],
+            api_secret=st.secrets["cloudinary"]["api_secret"],
+            secure=True,
+        )
+        return True
+    except Exception:
+        return False
+
 
 # =========================================================
 # DB LOCAL
@@ -85,20 +94,32 @@ def now_sp_time():
 
 def safe_int(value):
     try:
-        return int(float(str(value).replace(",", ".")))
+        if pd.isna(value):
+            return 0
+        txt = str(value).strip()
+        if not txt:
+            return 0
+        txt = txt.replace(".", "").replace(",", ".") if "," in txt and "." in txt else txt.replace(",", ".")
+        return int(float(txt))
     except Exception:
         return 0
 
 
 def safe_float(value):
     try:
-        return float(str(value).replace(".", "").replace(",", ".")) if isinstance(value, str) and "," in value and "." in value else float(str(value).replace(",", "."))
+        if pd.isna(value):
+            return 0.0
+        txt = str(value).strip()
+        if not txt:
+            return 0.0
+        txt = txt.replace(".", "").replace(",", ".") if "," in txt and "." in txt else txt.replace(",", ".")
+        return float(txt)
     except Exception:
         return 0.0
 
 
 def format_date_only(value):
-    if pd.isna(value):
+    if pd.isna(value) or value in [None, ""]:
         return ""
     try:
         return pd.to_datetime(value).strftime("%d/%m/%Y")
@@ -107,9 +128,12 @@ def format_date_only(value):
 
 
 def format_time_only(value):
-    if pd.isna(value):
+    if pd.isna(value) or value in [None, ""]:
         return ""
     try:
+        txt = str(value).strip()
+        if txt.count(":") >= 2 and len(txt) <= 8:
+            return txt
         return pd.to_datetime(value).strftime("%H:%M:%S")
     except Exception:
         return str(value)
@@ -157,7 +181,6 @@ def login_screen():
                 st.session_state["usuario"] = usuario
                 st.session_state["perfil"] = perfil
                 st.rerun()
-
         st.error("Usuário ou senha inválidos.")
 
 
@@ -175,11 +198,25 @@ def get_current_dt():
     return st.session_state.get("current_dt", "")
 
 
+def read_table(path):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path)
+    return pd.read_excel(path)
+
+
+def normalize_series_str(series):
+    return series.astype(str).str.strip()
+
+
 def infer_tipo_carga(df_dt):
     if "Tipo de carga" in df_dt.columns:
-        val = str(df_dt["Tipo de carga"].dropna().iloc[0]).upper() if not df_dt["Tipo de carga"].dropna().empty else ""
-        if val in ["CB", "CP", "CM"]:
-            return val
+        vals = df_dt["Tipo de carga"].dropna().astype(str).str.upper().str.strip()
+        if not vals.empty:
+            val = vals.iloc[0]
+            if val in ["CB", "CP", "CM"]:
+                return val
 
     if "Perfil de carregamento" in df_dt.columns:
         perfil = str(df_dt["Perfil de carregamento"].dropna().iloc[0]).upper() if not df_dt["Perfil de carregamento"].dropna().empty else ""
@@ -194,18 +231,12 @@ def infer_tipo_carga(df_dt):
 
 
 def produtividade_por_tipo(tipo):
-    mapa = {
-        "CB": 30,  # caixas/min
-        "CP": 80,
-        "CM": 50,
-    }
-    return mapa.get(tipo, 40)
+    return {"CB": 30, "CP": 80, "CM": 50}.get(tipo, 40)
 
 
 def status_item(sol, conf):
     sol = safe_int(sol)
     conf = safe_int(conf)
-
     if conf == 0:
         return "PENDENTE"
     if conf == sol:
@@ -215,10 +246,9 @@ def status_item(sol, conf):
 
 def dt_status_from_items(items):
     statuses = [status_item(v["sol"], v["conf"]) for v in items.values()]
-
     if all(s == "OK" for s in statuses) and statuses:
         return "FINALIZADO"
-    if any(s == "DIVERGENTE" for s in statuses) or any(s == "PENDENTE" for s in statuses):
+    if any(s in ["DIVERGENTE", "PENDENTE"] for s in statuses):
         return "DIVERGENTE"
     return "ABERTO"
 
@@ -233,7 +263,7 @@ def metric_card(label, value):
             border:1px solid #e5e7eb;
             box-shadow:0 2px 8px rgba(0,0,0,0.06);
             min-height:110px;
-            margin-bottom:10px;
+            margin-bottom:14px;
         ">
             <div style="font-size:12px;color:#6b7280;margin-bottom:8px;">{label}</div>
             <div style="font-size:18px;font-weight:700;color:#111827;line-height:1.35;">{value}</div>
@@ -244,6 +274,8 @@ def metric_card(label, value):
 
 
 def upload_pdf_cloudinary(pdf_bytes, public_id):
+    if not cloudinary_ready():
+        return ""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         temp_path = tmp.name
@@ -255,7 +287,7 @@ def upload_pdf_cloudinary(pdf_bytes, public_id):
             public_id=public_id,
             overwrite=True,
         )
-        return result["secure_url"]
+        return result.get("secure_url", "")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -279,12 +311,22 @@ def get_dt_conf(dt):
 
 
 def get_dt_list():
-    if not os.path.exists(VL06_FILE):
+    base = read_table(VL06_FILE)
+    if base.empty or "Nº transporte" not in base.columns:
         return []
-    base = pd.read_csv(VL06_FILE)
-    if "Nº transporte" not in base.columns:
-        return []
-    return sorted(base["Nº transporte"].dropna().astype(str).unique().tolist())
+    return sorted(base["Nº transporte"].dropna().astype(str).str.strip().unique().tolist())
+
+
+def get_sku_map(sku_df):
+    sku_col = "SKU"
+    qtd_col = "Quantidade por palete"
+    if sku_col not in sku_df.columns or qtd_col not in sku_df.columns:
+        raise ValueError("A base SKU precisa conter as colunas 'SKU' e 'Quantidade por palete'.")
+    return dict(zip(
+        sku_df[sku_col].astype(str).str.strip(),
+        pd.to_numeric(sku_df[qtd_col], errors="coerce").fillna(0).astype(int)
+    ))
+
 
 # =========================================================
 # PDF
@@ -344,7 +386,6 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
     info_table = Table(info_rows, colWidths=[42 * mm, 100 * mm, 42 * mm, 104 * mm])
     info_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#c9d2de")),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
         ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -355,7 +396,7 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
     story.append(info_table)
     story.append(Spacer(1, 10))
 
-    item_rows = [["Remessa", "Material", "Descrição", "Qtd Sol.", "Qtd Conf.", "Status"]]
+    item_rows = [["Remessa", "Material", "Descrição", "Qtd. Solicitada", "Qtd. Conferida", "Status"]]
     for _, row in df_items.iterrows():
         item_rows.append([
             str(row["remessa"]),
@@ -366,12 +407,7 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
             str(row["Status"]),
         ])
 
-    item_table = Table(
-        item_rows,
-        colWidths=[28 * mm, 36 * mm, 110 * mm, 24 * mm, 24 * mm, 28 * mm],
-        repeatRows=1,
-    )
-
+    item_table = Table(item_rows, colWidths=[28 * mm, 36 * mm, 110 * mm, 28 * mm, 28 * mm, 28 * mm], repeatRows=1)
     item_style = TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1026D6")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -385,9 +421,10 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
     ])
 
     for i in range(1, len(item_rows)):
-        if item_rows[i][5] == "OK":
+        status = item_rows[i][5]
+        if status == "OK":
             item_style.add("BACKGROUND", (5, i), (5, i), colors.HexColor("#d9f2df"))
-        elif item_rows[i][5] == "DIVERGENTE":
+        elif status == "DIVERGENTE":
             item_style.add("BACKGROUND", (5, i), (5, i), colors.HexColor("#f8d7da"))
         else:
             item_style.add("BACKGROUND", (5, i), (5, i), colors.HexColor("#fff3cd"))
@@ -434,11 +471,7 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
                 b.get("usuario", ""),
             ])
 
-        boc_table = Table(
-            boc_rows,
-            colWidths=[35 * mm, 28 * mm, 28 * mm, 90 * mm, 16 * mm, 28 * mm],
-            repeatRows=1,
-        )
+        boc_table = Table(boc_rows, colWidths=[35 * mm, 28 * mm, 28 * mm, 90 * mm, 16 * mm, 28 * mm], repeatRows=1)
         boc_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1026D6")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -446,8 +479,6 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
             ("FONTSIZE", (0, 0), (-1, -1), 8),
             ("TOPPADDING", (0, 0), (-1, -1), 6),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]))
         story.append(boc_table)
         story.append(Spacer(1, 12))
@@ -464,8 +495,6 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
     assinatura_table.setStyle(TableStyle([
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     story.append(assinatura_table)
     story.append(Spacer(1, 10))
@@ -483,10 +512,15 @@ def build_pdf_bytes(dt, df_items, insumos, boc, meta, qr_img_path=None):
 
 
 def gerar_pdf(dt, df_items, insumos, boc, meta):
-    public_id = f"espelho_dt_{dt}"
-
     first_pdf = build_pdf_bytes(dt, df_items, insumos, boc, meta)
+    if not cloudinary_ready():
+        return "", first_pdf
+
+    public_id = f"espelho_dt_{dt}"
     first_url = upload_pdf_cloudinary(first_pdf, public_id)
+
+    if not first_url:
+        return "", first_pdf
 
     qr_path = f"qr_{dt}.png"
     qrcode.make(first_url).save(qr_path)
@@ -498,7 +532,8 @@ def gerar_pdf(dt, df_items, insumos, boc, meta):
         if os.path.exists(qr_path):
             os.remove(qr_path)
 
-    return final_url
+    return final_url, final_pdf
+
 
 # =========================================================
 # PÁGINA ASSISTENTE
@@ -507,19 +542,41 @@ def page_assistente():
     show_logo_main()
     st.title("Assistente")
 
-    f_vl06 = st.file_uploader("Upload VL06", type=["xlsx"], key="upl_vl06")
-    if f_vl06 is not None:
-        df_vl06 = pd.read_excel(f_vl06)
-        df_vl06.to_csv(VL06_FILE, index=False)
-        st.success("VL06 carregada com sucesso.")
-        st.dataframe(df_vl06.head(20), use_container_width=True)
+    st.caption("Arquivos esperados: base_vl06.xlsx e BASE SKU.xlsx")
 
-    f_sku = st.file_uploader("Upload Base SKU", type=["xlsx"], key="upl_sku")
+    f_vl06 = st.file_uploader("Upload VL06", type=["xlsx", "csv"], key="upl_vl06")
+    if f_vl06 is not None:
+        if f_vl06.name.lower().endswith(".csv"):
+            df_vl06 = pd.read_csv(f_vl06)
+        else:
+            df_vl06 = pd.read_excel(f_vl06)
+        if "Nº transporte" not in df_vl06.columns:
+            st.error("A VL06 enviada não possui a coluna 'Nº transporte'.")
+        else:
+            df_vl06.to_excel(VL06_FILE, index=False)
+            st.success("VL06 carregada com sucesso.")
+            st.dataframe(df_vl06.head(20), use_container_width=True)
+
+    f_sku = st.file_uploader("Upload Base SKU", type=["xlsx", "csv"], key="upl_sku")
     if f_sku is not None:
-        df_sku = pd.read_excel(f_sku)
-        df_sku.to_csv(SKU_FILE, index=False)
-        st.success("Base SKU carregada com sucesso.")
-        st.dataframe(df_sku.head(20), use_container_width=True)
+        if f_sku.name.lower().endswith(".csv"):
+            df_sku = pd.read_csv(f_sku)
+        else:
+            df_sku = pd.read_excel(f_sku)
+        if "SKU" not in df_sku.columns or "Quantidade por palete" not in df_sku.columns:
+            st.error("A base SKU precisa conter 'SKU' e 'Quantidade por palete'.")
+        else:
+            df_sku.to_excel(SKU_FILE, index=False)
+            st.success("Base SKU carregada com sucesso.")
+            st.dataframe(df_sku[["SKU", "Descrição", "Quantidade por palete"]].head(20), use_container_width=True)
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write(f"VL06 encontrada: {'Sim' if os.path.exists(VL06_FILE) else 'Não'}")
+    with c2:
+        st.write(f"Base SKU encontrada: {'Sim' if os.path.exists(SKU_FILE) else 'Não'}")
+
 
 # =========================================================
 # PÁGINA INSUMOS
@@ -528,7 +585,8 @@ def page_insumos():
     show_logo_main()
     st.title("Insumos")
 
-    if not os.path.exists(VL06_FILE):
+    base = read_table(VL06_FILE)
+    if base.empty:
         st.warning("Suba a VL06 primeiro.")
         return
 
@@ -539,8 +597,7 @@ def page_insumos():
 
     st.info(f"DT atual: {dt}")
 
-    base = pd.read_csv(VL06_FILE)
-    df_dt = base[base["Nº transporte"].astype(str) == dt].copy()
+    df_dt = base[base["Nº transporte"].astype(str).str.strip() == str(dt).strip()].copy()
     if df_dt.empty:
         st.warning("DT não encontrada na VL06.")
         return
@@ -552,10 +609,10 @@ def page_insumos():
 
     ins = db["insumos"].get(dt, {})
 
-    pal = st.number_input("Palete", value=int(ins.get("Palete", 0)))
-    cha = st.number_input("Chapa", value=int(ins.get("Chapa", 0)))
-    qs = st.number_input("Quadro sem ripa", value=int(ins.get("Quadro sem ripa", 0)))
-    qc = st.number_input("Quadro com ripa", value=int(ins.get("Quadro com ripa", 0)))
+    pal = st.number_input("Palete", min_value=0, value=int(ins.get("Palete", 0)), step=1)
+    cha = st.number_input("Chapa", min_value=0, value=int(ins.get("Chapa", 0)), step=1)
+    qs = st.number_input("Quadro sem ripa", min_value=0, value=int(ins.get("Quadro sem ripa", 0)), step=1)
+    qc = st.number_input("Quadro com ripa", min_value=0, value=int(ins.get("Quadro com ripa", 0)), step=1)
 
     c1, c2 = st.columns(2)
     if c1.button("Salvar Insumos", use_container_width=True):
@@ -572,22 +629,23 @@ def page_insumos():
     if c2.button("Editar Insumos", use_container_width=True):
         st.info("Altere os campos acima e clique em Salvar Insumos.")
 
+
 # =========================================================
 # PÁGINA CONFERÊNCIA
 # =========================================================
 def page_conferencia(modo_coletor=False):
-    if not os.path.exists(VL06_FILE) or not os.path.exists(SKU_FILE):
+    base = read_table(VL06_FILE)
+    sku_df = read_table(SKU_FILE)
+
+    if base.empty or sku_df.empty:
         st.warning("Suba VL06 e base SKU primeiro.")
         return
 
-    base = pd.read_csv(VL06_FILE)
-    sku_df = pd.read_csv(SKU_FILE)
-
-    if sku_df.shape[1] < 2:
-        st.error("A base SKU precisa ter SKU na primeira coluna e quantidade por palete na segunda.")
+    try:
+        sku_map = get_sku_map(sku_df)
+    except Exception as e:
+        st.error(str(e))
         return
-
-    sku_map = dict(zip(sku_df.iloc[:, 0].astype(str), pd.to_numeric(sku_df.iloc[:, 1], errors="coerce").fillna(0).astype(int)))
 
     show_logo_main()
     st.title("Modo Coletor" if modo_coletor else "Conferência")
@@ -603,7 +661,7 @@ def page_conferencia(modo_coletor=False):
     dt = st.selectbox("Selecione a DT", filtradas)
     set_current_dt(dt)
 
-    df_dt = base[base["Nº transporte"].astype(str) == dt].copy()
+    df_dt = base[base["Nº transporte"].astype(str).str.strip() == str(dt).strip()].copy()
     if df_dt.empty:
         st.warning("DT não encontrada.")
         return
@@ -624,10 +682,10 @@ def page_conferencia(modo_coletor=False):
         save_db(db)
 
     for _, row in df_dt.iterrows():
-        sku = str(row["Material"])
+        sku = str(row["Material"]).strip()
         if sku not in conf["itens"]:
             conf["itens"][sku] = {
-                "sol": safe_int(row["Qtd.remessa"]),
+                "sol": safe_int(row.get("Qtd.remessa", 0)),
                 "conf": 0,
                 "descricao": str(row.get("Denominação de item", "")),
                 "remessa": str(row.get("Remessa", "")),
@@ -640,12 +698,12 @@ def page_conferencia(modo_coletor=False):
     perfil_carregamento = str(df_dt.iloc[0].get("Perfil de carregamento", ""))
     tipo = infer_tipo_carga(df_dt)
     conf["tipo"] = tipo
+    save_db(db)
 
     metragem_cubica = round(pd.to_numeric(df_dt["Volume"], errors="coerce").fillna(0).sum() / 1000, 3) if "Volume" in df_dt.columns else 0
-    sku_unicos = df_dt["Material"].astype(str).nunique()
-    remessas = df_dt["Remessa"].astype(str).nunique()
+    sku_unicos = df_dt["Material"].astype(str).str.strip().nunique()
+    remessas = df_dt["Remessa"].astype(str).str.strip().nunique()
     total_caixas = int(pd.to_numeric(df_dt["Qtd.remessa"], errors="coerce").fillna(0).sum())
-
     produtividade = produtividade_por_tipo(tipo)
 
     inicio_real = datetime.strptime(f"{conf['inicio_data']} {conf['inicio_hora']}", "%d/%m/%Y %H:%M:%S").replace(tzinfo=APP_TZ)
@@ -656,7 +714,7 @@ def page_conferencia(modo_coletor=False):
 
     st.subheader("Resumo da DT")
 
-    r1 = st.columns(4, gap="medium")
+    r1 = st.columns(4, gap="large")
     with r1[0]:
         metric_card("Cliente", cliente)
     with r1[1]:
@@ -666,7 +724,7 @@ def page_conferencia(modo_coletor=False):
     with r1[3]:
         metric_card("Quantidade de remessas", remessas)
 
-    r2 = st.columns(4, gap="medium")
+    r2 = st.columns(4, gap="large")
     with r2[0]:
         metric_card("SKU únicos", sku_unicos)
     with r2[1]:
@@ -676,7 +734,7 @@ def page_conferencia(modo_coletor=False):
     with r2[3]:
         metric_card("Hora agenda", hora_agenda)
 
-    r3 = st.columns(4, gap="medium")
+    r3 = st.columns(4, gap="large")
     with r3[0]:
         metric_card("Perfil de carregamento", perfil_carregamento)
     with r3[1]:
@@ -686,7 +744,7 @@ def page_conferencia(modo_coletor=False):
     with r3[3]:
         metric_card("Previsão de conferência", f"{previsao_total:.1f} min")
 
-    r4 = st.columns(3, gap="medium")
+    r4 = st.columns(3, gap="large")
     with r4[0]:
         metric_card("Tempo real", f"{tempo_real:.1f} min")
     with r4[1]:
@@ -697,20 +755,24 @@ def page_conferencia(modo_coletor=False):
     st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
-    conf["conferente"] = c1.text_input("Conferente", value=conf.get("conferente", ""))
-    conf["turno"] = c2.selectbox("Turno", ["T1", "T2", "T3"], index=["T1", "T2", "T3"].index(conf.get("turno") or "T1"))
+    novo_conf = c1.text_input("Conferente", value=conf.get("conferente", ""))
+    novo_turno = c2.selectbox("Turno", ["T1", "T2", "T3"], index=["T1", "T2", "T3"].index(conf.get("turno") or "T1"))
     c3.text_input("Hora início", value=f"{conf['inicio_data']} {conf['inicio_hora']}".strip(), disabled=True)
     c4.text_input("Hora fim", value=(f"{conf['fim_data']} {conf['fim_hora']}".strip() if conf["fim_hora"] else ""), disabled=True)
+
+    if novo_conf != conf.get("conferente", "") or novo_turno != conf.get("turno", "T1"):
+        conf["conferente"] = novo_conf
+        conf["turno"] = novo_turno
+        save_db(db)
 
     if tipo == "CP":
         st.info("Esta DT é CP. O botão de insumos foi liberado automaticamente.")
         if st.button("Ir para Insumos", use_container_width=True):
             st.session_state["menu_target"] = "Insumos"
-            save_db(db)
             st.rerun()
 
     st.divider()
-    st.subheader("Lançamento por palete / fracionado")
+    st.subheader("Lançamento HO + HE")
 
     l1, l2, l3 = st.columns([2, 1, 1])
     sku_lancar = l1.text_input("SKU")
@@ -718,17 +780,22 @@ def page_conferencia(modo_coletor=False):
     qtd_he = l3.number_input("HE (Qtd Fracionada)", min_value=0, value=0, step=1)
 
     if st.button("Lançar Quantidades", use_container_width=True):
+        sku_lancar = str(sku_lancar).strip()
         if sku_lancar not in conf["itens"]:
             st.error("SKU não pertence a esta DT.")
         elif sku_lancar not in sku_map:
             st.error("SKU não cadastrado na base SKU.")
         else:
-            total_ho = int(sku_map[sku_lancar]) * int(qtd_ho)
+            caixas_por_palete = int(sku_map.get(sku_lancar, 0))
+            total_ho = caixas_por_palete * int(qtd_ho)
             total_add = total_ho + int(qtd_he)
-            conf["itens"][sku_lancar]["conf"] += total_add
-            save_db(db)
-            st.success(f"Lançado com sucesso: HO {qtd_ho} + HE {qtd_he} = +{total_add} caixas.")
-            st.rerun()
+            if total_add <= 0:
+                st.warning("Informe uma quantidade maior que zero.")
+            else:
+                conf["itens"][sku_lancar]["conf"] += total_add
+                save_db(db)
+                st.success(f"Lançado com sucesso: {qtd_ho} HO x {caixas_por_palete} + {qtd_he} HE = +{total_add} caixas.")
+                st.rerun()
 
     df_items = pd.DataFrame([
         {
@@ -746,7 +813,6 @@ def page_conferencia(modo_coletor=False):
     st.dataframe(df_items, use_container_width=True, hide_index=True)
 
     st.subheader("BOC")
-
     item_boc = st.text_input("Item BOC")
     qtd_boc = st.number_input("Qtd BOC", min_value=0, value=0, step=1)
 
@@ -756,7 +822,7 @@ def page_conferencia(modo_coletor=False):
         remessa_boc = conf["itens"][item_boc].get("remessa", "")
         descricao_boc = conf["itens"][item_boc].get("descricao", "")
 
-    if st.button("Salvar BOC"):
+    if st.button("Salvar BOC", use_container_width=True):
         db["boc"].setdefault(dt, []).append({
             "data_hora": now_sp_str(),
             "remessa": remessa_boc,
@@ -774,7 +840,7 @@ def page_conferencia(modo_coletor=False):
         st.write("BOCs lançados")
         for i, b in enumerate(bocs):
             bx1, bx2 = st.columns([6, 1])
-            bx1.write(f"{b['item']} | {b['qtd']} | {b.get('descricao','')}")
+            bx1.write(f"{b['item']} | {b['qtd']} | {b.get('descricao', '')}")
             if st.session_state["perfil"] == "assistente":
                 if bx2.button(f"Excluir {i}", key=f"exc_boc_{dt}_{i}"):
                     db["boc"][dt].pop(i)
@@ -805,11 +871,13 @@ def page_conferencia(modo_coletor=False):
             "responsavel": "Liderança / Responsável",
         }
 
-        pdf_url = gerar_pdf(dt, df_items, db["insumos"].get(dt, {}), db["boc"].get(dt, []), meta_pdf)
+        pdf_url, pdf_bytes = gerar_pdf(dt, df_items, db["insumos"].get(dt, {}), db["boc"].get(dt, []), meta_pdf)
         conf["pdf"] = pdf_url
         save_db(db)
         st.success("PDF gerado com sucesso.")
-        st.link_button("Abrir último PDF", pdf_url, use_container_width=True)
+        st.download_button("Baixar PDF", data=pdf_bytes, file_name=f"espelho_dt_{dt}.pdf", mime="application/pdf", use_container_width=True)
+        if pdf_url:
+            st.link_button("Abrir último PDF", pdf_url, use_container_width=True)
 
     if bpdf2.button("Finalizar Conferência", use_container_width=True):
         if tipo == "CP":
@@ -819,7 +887,6 @@ def page_conferencia(modo_coletor=False):
                 return
 
         status_final = dt_status_from_items(conf["itens"])
-
         conf["status"] = status_final
         conf["fim_data"] = now_sp_date()
         conf["fim_hora"] = now_sp_time()
@@ -849,12 +916,13 @@ def page_conferencia(modo_coletor=False):
             "responsavel": "Liderança / Responsável",
         }
 
-        pdf_url = gerar_pdf(dt, df_items, db["insumos"].get(dt, {}), db["boc"].get(dt, []), meta_pdf)
+        pdf_url, _ = gerar_pdf(dt, df_items, db["insumos"].get(dt, {}), db["boc"].get(dt, []), meta_pdf)
         conf["pdf"] = pdf_url
         save_db(db)
 
         st.success(f"Conferência finalizada com status: {status_final}")
         st.rerun()
+
 
 # =========================================================
 # PÁGINA REABRIR DT
@@ -886,6 +954,7 @@ def page_reabrir():
         save_db(db)
         st.success(f"DT {dt} reaberta e zerada com sucesso.")
         st.rerun()
+
 
 # =========================================================
 # PÁGINA GESTÃO
@@ -937,6 +1006,7 @@ def page_gestao():
     else:
         st.dataframe(divergentes, use_container_width=True, hide_index=True)
 
+
 # =========================================================
 # PÁGINA FATURAMENTO
 # =========================================================
@@ -962,6 +1032,7 @@ def page_faturista():
     st.subheader("Insumos")
     st.write(db["insumos"].get(dt, {}))
 
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -984,7 +1055,7 @@ op = st.sidebar.radio("Menu", sections, index=index_default)
 if op == "Assistente":
     page_assistente()
 elif op == "Conferência":
-    page_conferencia(True)
+    page_conferencia(False)
 elif op == "Coletor":
     page_conferencia(True)
 elif op == "Insumos":
